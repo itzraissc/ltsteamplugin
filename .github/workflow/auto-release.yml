@@ -1,0 +1,33 @@
+name: Gerar Release Automatica
+
+on:
+  push:
+    branches:
+      - main # ATENÇÃO: Se a sua branch principal chamar 'master', troque 'main' por 'master'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necessário para o bot conseguir ler as tags anteriores (como a 7.2.2)
+
+      - name: Descobrir e gerar a próxima versão (Tag)
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch # Isso fará a versão subir de 7.2.2 para 7.2.3, 7.2.4, etc.
+
+      - name: Criar a Release no GitHub
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          generateReleaseNotes: true # Aqui é a mágica: o GitHub vai auto-gerar a descrição da release baseado nos commits!
+          token: ${{ secrets.GITHUB_TOKEN }}
