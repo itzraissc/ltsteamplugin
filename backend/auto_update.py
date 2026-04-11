@@ -101,7 +101,7 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as api_err:
         logger.warn(f"AutoUpdate: GitHub API failed ({api_err}), trying proxy...")
         try:
-            proxy_url = "https://luatools.vercel.app/api/github-latest"
+            proxy_url = "https://luatoolsrai.vercel.app/api/github-latest"
             logger.log(f"AutoUpdate: Fetching GitHub release from proxy {proxy_url}")
             resp = client.get(proxy_url, follow_redirects=True, timeout=15)
             logger.log(f"AutoUpdate: Proxy GitHub API response: status={resp.status_code}")
@@ -134,7 +134,7 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     if not zip_url and tag_name:
-        zip_url = f"https://luatools.vercel.app/api/get-plugin/{tag_name}"
+        zip_url = f"https://luatoolsrai.vercel.app/api/get-plugin/{tag_name}"
         logger.log(f"AutoUpdate: Using proxy download URL: {zip_url}")
 
     if not zip_url:

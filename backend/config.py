@@ -15,7 +15,8 @@ DEFAULT_HEADERS = {
 }
 
 API_MANIFEST_URL = "https://raw.githubusercontent.com/madoiscool/lt_api_links/refs/heads/main/load_free_manifest_apis"
-API_MANIFEST_PROXY_URL = "https://luatools.vercel.app/load_free_manifest_apis"
+API_MANIFEST_API_URL = "https://luatoolsrai.vercel.app/api/manifest"
+OFFICIAL_API_URL = "https://luatoolsrai.vercel.app/api/manifest"
 API_JSON_FILE = "api.json"
 
 UPDATE_CONFIG_FILE = "update.json"
