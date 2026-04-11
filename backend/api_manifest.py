@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 from config import (
     API_JSON_FILE,
-    API_MANIFEST_PROXY_URL,
+    API_MANIFEST_API_URL as API_MANIFEST_PROXY_URL,
     API_MANIFEST_URL,
     HTTP_PROXY_TIMEOUT_SECONDS,
 )
