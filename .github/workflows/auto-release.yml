@@ -1,0 +1,38 @@
+name: Gerar Release Automatica
+
+on:
+  push:
+    branches:
+      - main # Verifique se sua branch é 'main' ou 'master'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descobrir e gerar a próxima versão (Tag)
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+
+      # Aqui definimos o nome exato do arquivo como solicitado
+      - name: Zipar os arquivos do plugin
+        run: zip -r ltsteamplugin.zip public backend requirements.txt plugin.json
+
+      - name: Criar a Release no GitHub
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          generateReleaseNotes: true
+          artifacts: "ltsteamplugin.zip" # Referência ao nome do arquivo para o download
+          token: ${{ secrets.GITHUB_TOKEN }}
