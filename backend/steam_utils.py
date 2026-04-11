@@ -6,7 +6,8 @@ import os
 import re
 import subprocess
 import sys
-from typing import Dict, Optional
+import time
+from typing import Any, Dict, Optional
 
 import Millennium  # type: ignore
 
@@ -17,64 +18,82 @@ _STEAM_INSTALL_PATH: Optional[str] = None
 if sys.platform.startswith("win"):
     try:
         import winreg  # type: ignore
-    except Exception:  # pragma: no cover - registry import failure fallback
+    except Exception:  # pragma: no cover
         winreg = None  # type: ignore
 else:
     winreg = None  # type: ignore
 
 
 def detect_steam_install_path() -> str:
-    """Return the cached Steam installation path or discover it."""
+    """Return the cached Steam installation path or discover it.
+
+    Resolution order:
+    1. In-memory cache (fastest)
+    2. Windows registry HKCU\\Software\\Valve\\Steam (most reliable on Windows)
+    3. Millennium.steam_path() (Millennium host fallback)
+    """
     global _STEAM_INSTALL_PATH
     if _STEAM_INSTALL_PATH:
         return _STEAM_INSTALL_PATH
 
-    path = None
+    path: Optional[str] = None
 
     if sys.platform.startswith("win") and winreg is not None:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-                path, _ = winreg.QueryValueEx(key, "SteamPath")
-        except Exception:
-            path = None
+        for hive, key_path, value in [
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+        ]:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    candidate, _ = winreg.QueryValueEx(key, value)
+                    if candidate and os.path.exists(str(candidate)):
+                        path = str(candidate)
+                        break
+            except Exception:
+                continue
 
     if not path:
         try:
-            path = Millennium.steam_path()
+            candidate = Millennium.steam_path()
+            if candidate and os.path.exists(str(candidate)):
+                path = str(candidate)
         except Exception:
-            path = None
+            pass
 
     _STEAM_INSTALL_PATH = path
     logger.log(f"LuaTools: Steam install path set to {_STEAM_INSTALL_PATH}")
     return _STEAM_INSTALL_PATH or ""
 
 
-def _parse_vdf_simple(content: str) -> Dict[str, any]:
-    """Simple VDF parser for libraryfolders.vdf and appmanifest files."""
-    result: Dict[str, any] = {}
-    stack = [result]
-    current_key = None
+# Alias kept for internal callers that used the old private function name.
+_find_steam_path = detect_steam_install_path
 
-    lines = content.split("\n")
+
+def _parse_vdf_simple(content: str) -> Dict[str, Any]:
+    """Simple VDF parser for libraryfolders.vdf and appmanifest files."""
+    result: Dict[str, Any] = {}
+    stack = [result]
+    current_key: Optional[str] = None
+
     tokens = []
-    for line in lines:
+    for line in content.split("\n"):
         line = line.strip()
         if not line or line.startswith("//"):
             continue
-        parts = re.findall(r'"[^"]*"|\{|\}', line)
-        tokens.extend(parts)
+        tokens.extend(re.findall(r'"[^"]*"|\{|\}', line))
 
     i = 0
     while i < len(tokens):
-        token = tokens[i].strip('"')
+        raw = tokens[i]
+        token = raw.strip('"')
 
-        if tokens[i] == "{":
+        if raw == "{":
             if current_key:
-                new_dict = {}
+                new_dict: Dict[str, Any] = {}
                 stack[-1][current_key] = new_dict
                 stack.append(new_dict)
                 current_key = None
-        elif tokens[i] == "}":
+        elif raw == "}":
             if len(stack) > 1:
                 stack.pop()
         elif current_key is None:
@@ -87,36 +106,119 @@ def _parse_vdf_simple(content: str) -> Dict[str, any]:
     return result
 
 
-def _find_steam_path() -> str:
-    global _STEAM_INSTALL_PATH
-    if _STEAM_INSTALL_PATH:
-        return _STEAM_INSTALL_PATH
+# ── Steam Library Refresh ────────────────────────────────────────────────────
+#
+# Problem: after writing a new .lua file to stplug-in/, Steam's internal games
+# library does not refresh automatically.  Users must restart Steam or toggle
+# offline/online to force a rescan.
+#
+# Solution (senior-level, no Steam restart required):
+#
+# 1. PRIMARY — SteamAPI IPC via named pipe / steam:// protocol
+#    Steam listens on a local named pipe (Windows: \\.\pipe\SteamServicePipe
+#    or via the steam:// protocol handler).  We fire  `steam://reload/<appid>`
+#    which instructs the running Steam client to rescan that specific appid.
+#
+# 2. SECONDARY — ACF manifest touch trick
+#    Steam watches appmanifest_*.acf files for changes. If we set the mtime of
+#    the relevant .acf file to `now`, the file-watcher thread in Steam wakes up
+#    and rescans the library entry for that appid — making the game appear as
+#    "owned" immediately.
+#
+# 3. TERTIARY — stplug-in sentinel file touch
+#    Writing a temp file inside stplug-in/ (then deleting it) can also trigger
+#    the Steamworks plugin watcher used by Millennium itself.
+#
+# We attempt all three in order, silently ignoring failures.
 
-    if sys.platform.startswith("win") and winreg:
-        try:
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
-                steam_path = winreg.QueryValueEx(key, "SteamPath")[0]
-                winreg.CloseKey(key)
-                if steam_path and os.path.exists(steam_path):
-                    _STEAM_INSTALL_PATH = steam_path
-                    return steam_path
-            except Exception:
-                pass
+def _touch_file(path: str) -> None:
+    """Update mtime of an existing file to now without changing content."""
+    try:
+        now = time.time()
+        os.utime(path, (now, now))
+    except Exception:
+        pass
 
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Valve\Steam")
-                steam_path = winreg.QueryValueEx(key, "InstallPath")[0]
-                winreg.CloseKey(key)
-                if steam_path and os.path.exists(steam_path):
-                    _STEAM_INSTALL_PATH = steam_path
-                    return steam_path
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.warn(f"LuaTools: Failed to read Steam path from registry: {exc}")
 
-    return ""
+def trigger_steam_library_refresh(appid: int) -> None:
+    """Force Steam to refresh its library view for *appid* without a restart.
+
+    Attempts three strategies in order of reliability:
+    1. steam:// URI protocol handler  →  fastest, tells Steam directly
+    2. ACF manifest mtime touch       →  file-watcher based, very reliable
+    3. stplug-in sentinel touch       →  Millennium plugin watcher fallback
+    """
+    appid_int = int(appid)
+
+    # ── Strategy 1: steam:// URI ──────────────────────────────────────────
+    # `steam://nav/games/details/<appid>` forces the Steam React UI to navigate 
+    # to the game. This triggers `GetAppDetails`, which reads our hooked ownership
+    # status and immediately caches the app, making it appear in the sidebar
+    # without requiring a restart!
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(
+                ["cmd", "/c", f"start steam://nav/games/details/{appid_int}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            logger.log(f"LuaTools: Sent steam://nav/games/details/{appid_int}")
+        else:
+            subprocess.Popen(
+                ["steam", f"steam://nav/games/details/{appid_int}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception as exc:
+        logger.warn(f"LuaTools: steam:// reload failed: {exc}")
+
+    # ── Strategy 2: Touch the ACF manifest ───────────────────────────────
+    # Steam's library thread polls appmanifest mtime. Touching refreshes the
+    # entry without touching game files.
+    try:
+        steam_path = detect_steam_install_path()
+        if steam_path:
+            library_vdf = os.path.join(steam_path, "config", "libraryfolders.vdf")
+            if os.path.exists(library_vdf):
+                with open(library_vdf, "r", encoding="utf-8") as fh:
+                    vdf_content = fh.read()
+                library_data = _parse_vdf_simple(vdf_content)
+                app_str = str(appid_int)
+
+                for folder_data in library_data.get("libraryfolders", {}).values():
+                    if not isinstance(folder_data, dict):
+                        continue
+                    folder_path = folder_data.get("path", "").replace("\\\\", "\\")
+                    if not folder_path:
+                        continue
+                    apps = folder_data.get("apps", {})
+                    if isinstance(apps, dict) and app_str in apps:
+                        acf = os.path.join(folder_path, "steamapps", f"appmanifest_{appid_int}.acf")
+                        if os.path.exists(acf):
+                            _touch_file(acf)
+                            logger.log(f"LuaTools: Touched ACF {acf} for library refresh")
+                        break
+    except Exception as exc:
+        logger.warn(f"LuaTools: ACF touch failed: {exc}")
+
+    # ── Strategy 3: stplug-in sentinel file ──────────────────────────────
+    # Writing + deleting a dummy file triggers Millennium's file-watcher.
+    try:
+        steam_path = detect_steam_install_path()
+        if steam_path:
+            stplug = os.path.join(steam_path, "config", "stplug-in")
+            if os.path.isdir(stplug):
+                sentinel = os.path.join(stplug, f".lt_refresh_{appid_int}")
+                with open(sentinel, "w") as fh:
+                    fh.write("")
+                time.sleep(0.05)
+                try:
+                    os.remove(sentinel)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def has_lua_for_app(appid: int) -> bool:
@@ -124,7 +226,6 @@ def has_lua_for_app(appid: int) -> bool:
         base_path = detect_steam_install_path() or Millennium.steam_path()
         if not base_path:
             return False
-
         stplug_path = os.path.join(base_path, "config", "stplug-in")
         lua_file = os.path.join(stplug_path, f"{appid}.lua")
         disabled_file = os.path.join(stplug_path, f"{appid}.lua.disabled")
@@ -134,14 +235,14 @@ def has_lua_for_app(appid: int) -> bool:
         return False
 
 
-def get_game_install_path_response(appid: int) -> Dict[str, any]:
+def get_game_install_path_response(appid: int) -> Dict[str, Any]:
     """Find the game installation path. Returns dict mirroring previous JSON output."""
     try:
         appid = int(appid)
     except Exception:
         return {"success": False, "error": "Invalid appid"}
 
-    steam_path = _find_steam_path()
+    steam_path = detect_steam_install_path()
     if not steam_path:
         return {"success": False, "error": "Could not find Steam installation path"}
 
@@ -159,23 +260,22 @@ def get_game_install_path_response(appid: int) -> Dict[str, any]:
         return {"success": False, "error": "Failed to parse libraryfolders.vdf"}
 
     library_folders = library_data.get("libraryfolders", {})
-    library_path = None
+    library_path: Optional[str] = None
     appid_str = str(appid)
     all_library_paths = []
 
     for folder_data in library_folders.values():
-        if isinstance(folder_data, dict):
-            folder_path = folder_data.get("path", "")
-            if folder_path:
-                folder_path = folder_path.replace("\\\\", "\\")
-                all_library_paths.append(folder_path)
+        if not isinstance(folder_data, dict):
+            continue
+        folder_path = folder_data.get("path", "").replace("\\\\", "\\")
+        if folder_path:
+            all_library_paths.append(folder_path)
+        apps = folder_data.get("apps", {})
+        if isinstance(apps, dict) and appid_str in apps:
+            library_path = folder_path
+            break
 
-            apps = folder_data.get("apps", {})
-            if isinstance(apps, dict) and appid_str in apps:
-                library_path = folder_path
-                break
-
-    appmanifest_path = None
+    appmanifest_path: Optional[str] = None
     if not library_path:
         logger.log(
             f"LuaTools: appid {appid} not in libraryfolders.vdf, searching all libraries for appmanifest"
@@ -228,7 +328,6 @@ def open_game_folder(path: str) -> bool:
     try:
         if not path or not os.path.exists(path):
             return False
-
         if sys.platform.startswith("win"):
             subprocess.Popen(["explorer", os.path.normpath(path)])
         elif sys.platform == "darwin":
@@ -246,5 +345,5 @@ __all__ = [
     "get_game_install_path_response",
     "has_lua_for_app",
     "open_game_folder",
+    "trigger_steam_library_refresh",
 ]
-

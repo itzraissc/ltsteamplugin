@@ -32,6 +32,9 @@ env.bak/
 venv.bak/
 .venv/
 
+#Agentes
+.agent/
+
 # IDE / Editor
 .vscode/
 .idea/
@@ -107,3 +110,8 @@ readme
 .claude/settings.local.json
 .claude/settings.local.json
 .claude/settings.local.json
+CLAUDE.md
+scripts/fill_translations.py
+scripts/
+install-plugin (1).ps1
+install-plugin (2).ps1

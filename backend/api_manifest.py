@@ -8,14 +8,14 @@ from typing import Any, Dict, List
 
 from config import (
     API_JSON_FILE,
-    API_MANIFEST_API_URL as API_MANIFEST_PROXY_URL,
+    API_MANIFEST_PROXY_URL,
     API_MANIFEST_URL,
     HTTP_PROXY_TIMEOUT_SECONDS,
 )
 from http_client import ensure_http_client, get_http_client
 from logger import logger
+from paths import backend_path
 from utils import (
-    backend_path,
     count_apis,
     normalize_manifest_text,
     read_text,

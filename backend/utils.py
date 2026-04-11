@@ -106,10 +106,8 @@ def ensure_temp_download_dir() -> str:
 
 
 __all__ = [
-    "backend_path",
-    "ensure_temp_download_dir",
     "count_apis",
-    "get_plugin_dir",
+    "ensure_temp_download_dir",
     "get_plugin_version",
     "normalize_manifest_text",
     "parse_version",

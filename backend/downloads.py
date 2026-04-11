@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import datetime
+import concurrent.futures
 from typing import Any, Dict
 
 import Millennium  # type: ignore
@@ -24,10 +25,9 @@ from config import (
     WEB_UI_JS_FILE,
 )
 from http_client import ensure_http_client
-import httpx
 from logger import logger
 from paths import backend_path, public_path
-from steam_utils import detect_steam_install_path, has_lua_for_app
+from steam_utils import detect_steam_install_path, has_lua_for_app, trigger_steam_library_refresh
 from utils import count_apis, ensure_temp_download_dir, normalize_manifest_text, read_text, write_text
 
 DOWNLOAD_STATE: Dict[int, Dict[str, Any]] = {}
@@ -37,7 +37,7 @@ DOWNLOAD_LOCK = threading.Lock()
 APP_NAME_CACHE: Dict[int, str] = {}
 APP_NAME_CACHE_LOCK = threading.Lock()
 
-APP_INFO_CACHE: Dict = {}
+APP_INFO_CACHE: Dict[int, Dict[str, Any]] = {}
 APP_INFO_CACHE_LOCK = threading.Lock()
 
 # Rate limiting for Steam API calls
@@ -56,9 +56,24 @@ GAMES_DB_FILE_NAME = "games.json"
 GAMES_DB_URL = "https://toolsdb.piqseu.cc/games.json"
 
 # In-memory games database cache and lock (defined to avoid undefined variable)
-GAMES_DB_DATA: Dict[int, Any] = {}
-GAMES_DB_LOADED = False
-GAMES_DB_LOCK = threading.Lock()
+GAMES_DB_DATA: Dict[str, Any] = {}
+GAMES_DB_LOADED: bool = False
+GAMES_DB_LOCK = threading.RLock()
+
+
+def _fix_mojibake(name: str) -> str:
+    """Fix common UTF-8 strings incorrectly decoded as Windows-1251 by external APIs."""
+    if not name:
+        return name
+    try:
+        # Detect Cyrillic mojibake markers for trademark, registered, copyright, dashes, or accented characters
+        if any(token in name for token in ("в„", "В®", "В©", "Г", "Р", "в€™", "в€“", "в€”")):
+            return name.encode("cp1251").decode("utf-8")
+    except Exception:
+        pass
+    
+    # Generic fallback for common symbols if pure recoding fails
+    return name.replace("в„ў", "™").replace("В®", "®").replace("В©", "©").replace("в€™", "'").replace("в€“", "-").replace("в€”", "-")
 
 
 def _set_download_state(appid: int, update: dict) -> None:
@@ -130,7 +145,7 @@ def _fetch_app_name(appid: int) -> str:
             inner = entry.get("data") or {}
             name = inner.get("name")
             if isinstance(name, str) and name.strip():
-                name = name.strip()
+                name = _fix_mojibake(name.strip())
                 # Cache the result
                 with APP_NAME_CACHE_LOCK:
                     APP_NAME_CACHE[appid] = name
@@ -146,12 +161,11 @@ def _fetch_app_name(appid: int) -> str:
 
 def _fetch_app_info(appid: int) -> dict:
     """Fetch app info from steamcmd with caching.
-    
+
     Fallback order:
     1. In-memory cache
     2. Steamcmd.net (request)
     """
-    global LAST_API_CALL_TIME
 
     # Check cache first
     with APP_INFO_CACHE_LOCK:
@@ -351,7 +365,7 @@ def _load_applist_into_memory() -> None:
                         appid = entry.get("appid")
                         name = entry.get("name")
                         if appid and name and isinstance(name, str) and name.strip():
-                            APPLIST_DATA[int(appid)] = name.strip()
+                            APPLIST_DATA[int(appid)] = _fix_mojibake(name.strip())
                             count += 1
                 logger.log(f"LuaTools: Loaded {count} app names from applist into memory")
             else:
@@ -580,19 +594,26 @@ def _process_and_install_lua(appid: int, zip_path: str) -> None:
             text = data.decode("utf-8", errors="replace")
 
         processed_lines = []
-        depots = { "ids": [] , "lines": {} }
+        depots: Dict[str, Any] = {"ids": [], "lines": {}}
+        
+        # Otimização RegEx: Compilação Antecipada (Evita reinicialização mil vezes no for loop)
+        rx_manifest = re.compile(r"^\s*setManifestid\(")
+        rx_appid = re.compile(r"^\s*addappid\(")
+        rx_comment = re.compile(r"^\s*--")
+        rx_digits = re.compile(r"\d+")
+        rx_space = re.compile(r"^(\s*)")
+        
         for line in text.splitlines(True):
-            if re.match(r"^\s*setManifestid\(", line) and not re.match(r"^\s*--", line):
-                line = re.sub(r"^(\s*)", r"\1--", line)
+            if rx_manifest.match(line) and not rx_comment.match(line):
+                line = rx_space.sub(r"\1--", line)
             processed_lines.append(line)
-            if re.match(r"^\s*addappid\(", line) and not re.match(r"^\s*--", line):
-                if (m := re.search(r"\d+", line)):
-                    id = m.group()
-
-                    depots["ids"].append(id)
-                    if id not in depots["lines"]:
-                        depots["lines"][id] = []
-                    depots["lines"][id] = line
+            
+            if rx_appid.match(line) and not rx_comment.match(line):
+                if (m := rx_digits.search(line)):
+                    depot_id = m.group()
+                    if depot_id not in depots["ids"]:
+                        depots["ids"].append(depot_id)
+                    depots["lines"][depot_id] = line
             
         processed_text = "".join(processed_lines)
 
@@ -600,10 +621,27 @@ def _process_and_install_lua(appid: int, zip_path: str) -> None:
         dest_file = os.path.join(target_dir, f"{appid}.lua")
         if _is_download_cancelled(appid):
             raise RuntimeError("cancelled")
+            
+        # Delay to allow NTFS to index depotcache/*.manifest files
+        # Prevents race conditions where Steam reads the new .lua before manifests are physically available
+        time.sleep(0.3)  # Reduzido de 0.5 para 0.3 (Suficiente após a extração RAM síncrona)
+        
         with open(dest_file, "w", encoding="utf-8") as output:
             output.write(processed_text)
+            output.flush()
+            os.fsync(output.fileno())  # Force immediate flush to disk purely for the .lua file
+            
         logger.log(f"LuaTools: Installed lua -> {dest_file}")
+
         _set_download_state(appid, {"installedPath": dest_file})
+
+        # Trigger Steam library refresh so the game appears immediately
+        # without requiring a Steam restart or offline/online toggle.
+        # Uses 3 strategies: steam:// URI, ACF mtime touch, sentinel file.
+        try:
+            trigger_steam_library_refresh(appid)
+        except Exception as refresh_exc:
+            logger.warn(f"LuaTools: Library refresh failed (non-fatal): {refresh_exc}")
 
         # Check .lua content
         try:
@@ -612,24 +650,33 @@ def _process_and_install_lua(appid: int, zip_path: str) -> None:
             
             info = _fetch_app_info(appid)
             
-            # Workshop presence
+            # Workshop presence check
+            # BUG FIX: work_depot is str (result of str()), not int.
+            # Comparing str to int (== 0) always returns False in Python 3,
+            # which caused workshop to always show "Missing ❌" even without a workshop.
             work_depot = str(info.get("workshop_depot", 0))
-            if work_depot == 0:
+            if work_depot in ("0", "", "None", "False"):
                 workshop_result = "No workshop for the game ✅"
             else:
-                # Checking if mentionned in addappid lines + if it includes a decryption key
-                if work_depot in depots["ids"] and re.search(rf",\d+,[\"']", depots["lines"][work_depot].replace(" ", "")):
+                # Check if this depot is in addappid lines AND has a decryption key
+                if work_depot in depots["ids"] and re.search(
+                    r",\d+,[\"']", depots["lines"].get(work_depot, "").replace(" ", "")
+                ):
                     workshop_result = "Included 🎉"
                 else:
                     workshop_result = "Missing ❌"
             
-            # Dlc listing
-            dlc_result = { "included": [], "missing": [] }
-            if info.get("dlc_list", "") != "":
-                dlcs = info["dlc_list"].split(",")
-
+            # DLC listing
+            # BUG FIX: previously `if int(dlc) in depots:` checked whether
+            # the integer was a KEY of the dict {"ids": ..., "lines": ...},
+            # which is always False. Fixed to check depots["ids"] (a list of str).
+            dlc_result: Dict[str, list] = {"included": [], "missing": []}
+            dlc_list_raw = info.get("dlc_list", "")
+            if dlc_list_raw:
+                dlcs = [d.strip() for d in dlc_list_raw.split(",") if d.strip()]
                 for dlc in dlcs:
-                    if int(dlc) in depots:
+                    # depots["ids"] contains string depot IDs
+                    if str(dlc) in depots["ids"]:
                         dlc_result["included"].append(int(dlc))
                     else:
                         dlc_result["missing"].append(int(dlc))
@@ -727,7 +774,7 @@ def _download_zip_for_app(appid: int):
                 total = int(resp.headers.get("Content-Length", "0") or "0")
                 _set_download_state(appid, {"status": "downloading", "bytesRead": 0, "totalBytes": total})
                 with open(dest_path, "wb") as output:
-                    for chunk in resp.iter_bytes():
+                    for chunk in resp.iter_bytes(chunk_size=65536):
                         if not chunk:
                             continue
                         if _is_download_cancelled(appid):
@@ -822,24 +869,167 @@ def _download_zip_for_app(appid: int):
             return
         except Exception as err:
             logger.warn(f"LuaTools: API '{name}' failed with error: {err}")
-            # Track error for this API - check if it's a timeout
-            error_type = "timeout" if isinstance(err, (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout)) else "error"
-            error_code = None
-            if isinstance(err, httpx.HTTPStatusError):
-                error_code = err.response.status_code if err.response else None
-            elif hasattr(err, "response") and err.response:
-                error_code = err.response.status_code
-            
+            # Detect timeout by class name to avoid a hard dependency on httpx internals
+            err_class = type(err).__name__.lower()
+            is_timeout = "timeout" in err_class or "readtimeout" in err_class or "connecttimeout" in err_class
+            error_type = "timeout" if is_timeout else "error"
+            error_code: Any = None
+            resp_obj = getattr(err, "response", None)
+            if resp_obj is not None:
+                error_code = getattr(resp_obj, "status_code", None)
+
             state = _get_download_state(appid)
             api_errors = state.get("apiErrors", {})
-            if error_type == "timeout":
-                api_errors[name] = {"type": "timeout"}
-            else:
-                api_errors[name] = {"type": "error", "code": error_code}
+            api_errors[name] = {"type": error_type, "code": error_code}
             _set_download_state(appid, {"apiErrors": api_errors})
             continue
 
     _set_download_state(appid, {"status": "failed", "error": "Not available on any API"})
+
+
+def check_apis_for_app(appid: int) -> str:
+    """Check all enabled APIs for a specific appid and return their availability.
+
+    Called by the frontend before showing the 'Select Download Source' dialog.
+    Uses HEAD requests (GET fallback) to avoid downloading data unnecessarily.
+    """
+    try:
+        appid = int(appid)
+    except Exception:
+        return json.dumps({"success": False, "error": "Invalid appid"})
+
+    client = ensure_http_client("LuaTools: check_apis")
+    apis = load_api_manifest()
+    if not apis:
+        return json.dumps({"success": True, "results": []})
+
+    morrenus_api_key = get_morrenus_api_key()
+    headers = {"User-Agent": USER_AGENT}
+
+    # Fast-path: Ryuu endpoint returns availability for all APIs at once
+    fast_check_data: Dict[str, Any] = {}
+    try:
+        fast_resp = client.get(
+            f"http://167.235.229.108/check_apis?appid={appid}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=5,
+            follow_redirects=True,
+        )
+        if fast_resp.status_code == 200:
+            data = fast_resp.json()
+            if isinstance(data, dict):
+                fast_check_data = data
+    except Exception as exc:
+        logger.warn(f"LuaTools: Fast API check failed (non-fatal): {exc}")
+
+    def _check_api(api: Dict[str, Any]) -> Dict[str, Any]:
+        name = api.get("name", "Unknown")
+        template = api.get("url", "")
+        success_code = int(api.get("success_code", 200))
+
+        if "<moapikey>" in template:
+            if not morrenus_api_key:
+                return {}  # Not enabled
+            template = template.replace("<moapikey>", morrenus_api_key)
+
+        url = template.replace("<appid>", str(appid))
+        available = False
+
+        # Use fast-check result if present
+        if fast_check_data:
+            check_key = "Sadie (Morrenus)" if name.lower() == "morrenus" else name
+            available = fast_check_data.get(check_key) == "available"
+        else:
+            try:
+                if name.lower() == "morrenus":
+                    status_url = (
+                        f"https://manifest.morrenus.xyz/api/v1/status/{appid}"
+                        f"?api_key={morrenus_api_key}"
+                    )
+                    resp = client.get(status_url, headers=headers, follow_redirects=True, timeout=5)
+                    available = resp.status_code == success_code
+                else:
+                    resp = client.head(url, headers=headers, follow_redirects=True, timeout=5)
+                    if resp.status_code == 405:  # HEAD not allowed — fall back to GET
+                        resp = client.get(url, headers=headers, follow_redirects=True, timeout=5)
+                    available = resp.status_code == success_code
+            except Exception:
+                pass
+
+        return {
+            "name": name,
+            "available": available,
+            "url": url if available else None,
+        }
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for result in executor.map(_check_api, apis):
+            if result:
+                results.append(result)
+
+    return json.dumps({"success": True, "results": results})
+
+
+def _download_zip_from_url(appid: int, url: str, api_name: str):
+    """Internal worker to download from a specific URL."""
+    client = ensure_http_client("LuaTools: download_direct")
+    dest_root = ensure_temp_download_dir()
+    dest_path = os.path.join(dest_root, f"{appid}.zip")
+    
+    _set_download_state(appid, {"status": "downloading", "currentApi": api_name, "bytesRead": 0, "totalBytes": 0, "dest": dest_path})
+
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length", "0") or "0")
+            _set_download_state(appid, {"totalBytes": total})
+            
+            with open(dest_path, "wb") as output:
+                for chunk in resp.iter_bytes(chunk_size=65536):
+                    if not chunk: continue
+                    if _is_download_cancelled(appid):
+                        raise RuntimeError("cancelled")
+                    output.write(chunk)
+                    state = _get_download_state(appid)
+                    read = int(state.get("bytesRead", 0)) + len(chunk)
+                    _set_download_state(appid, {"bytesRead": read})
+
+        _set_download_state(appid, {"status": "processing"})
+        _process_and_install_lua(appid, dest_path)
+        
+        try:
+            fetched_name = _fetch_app_name(appid) or f"UNKNOWN ({appid})"
+            _append_loaded_app(appid, fetched_name)
+            _log_appid_event(f"ADDED - {api_name}", appid, fetched_name)
+        except Exception:
+            pass
+            
+        _set_download_state(appid, {"status": "done", "success": True, "api": api_name})
+
+    except Exception as exc:
+        if str(exc) == "cancelled":
+            if os.path.exists(dest_path):
+                try: os.remove(dest_path)
+                except Exception: pass
+            _set_download_state(appid, {"status": "cancelled", "error": "Cancelled by user"})
+        else:
+            logger.warn(f"LuaTools: _download_zip_from_url failed: {exc}")
+            _set_download_state(appid, {"status": "failed", "error": str(exc)})
+
+
+def start_add_via_luatools_from_url(appid: int, url: str, api_name: str) -> str:
+    """Initiate a download from a specific URL selected by the user."""
+    try:
+        appid = int(appid)
+    except Exception:
+        return json.dumps({"success": False, "error": "Invalid appid"})
+
+    _set_download_state(appid, {"status": "queued", "bytesRead": 0, "totalBytes": 0, "error": None})
+    thread = threading.Thread(target=_download_zip_from_url, args=(appid, url, api_name), daemon=True)
+    thread.start()
+    return json.dumps({"success": True})
 
 
 def start_add_via_luatools(appid: int) -> str:
@@ -1047,6 +1237,7 @@ def get_installed_lua_scripts() -> str:
 
 __all__ = [
     "cancel_add_via_luatools",
+    "check_apis_for_app",
     "delete_luatools_for_app",
     "dismiss_loaded_apps",
     "fetch_app_name",
@@ -1060,4 +1251,5 @@ __all__ = [
     "init_games_db",
     "read_loaded_apps",
     "start_add_via_luatools",
+    "start_add_via_luatools_from_url",
 ]

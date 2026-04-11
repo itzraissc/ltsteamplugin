@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 import zipfile
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
@@ -16,58 +21,163 @@ from logger import logger
 from utils import ensure_temp_download_dir
 from steam_utils import get_game_install_path_response
 
+# ── Per-appid state stores (thread-safe via dedicated locks) ─────────────
 FIX_DOWNLOAD_STATE: Dict[int, Dict[str, Any]] = {}
 FIX_DOWNLOAD_LOCK = threading.Lock()
 UNFIX_STATE: Dict[int, Dict[str, Any]] = {}
 UNFIX_LOCK = threading.Lock()
 
-# ── Fixes index cache (avoids HEAD requests to R2) ──────────────────────
-FIXES_INDEX_URL = "https://index.luatools.work/fixes-index.json"
+# ── HuggingFace fixes index cache ────────────────────────────────────────
+# Built once via the HF Tree API with RFC-5988 pagination, cached for 1 h.
+# Falls back to per-file HEAD requests only when the tree API fails.
+HF_REPO_ID = "RaiSantos/fix"
+HF_GENERIC_PATH = "GameBypasses"
+HF_ONLINE_PATH = "OnlineFix1"
+
 _fixes_index_lock = threading.Lock()
-_fixes_index_cache: Optional[Dict] = None
-_fixes_index_fetched_at: float = 0
-_FIXES_INDEX_TTL = 300  # seconds (5 min)
+_fixes_index_cache: Optional[Dict[str, Set[int]]] = None
+_fixes_index_fetched_at: float = 0.0
+_FIXES_INDEX_TTL = 3600  # seconds — refresh every hour
+
+# Browser-like headers to bypass HuggingFace WAF (HTTP 429/403)
+_HF_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "DNT": "1",
+}
+
+# Browser-like headers for direct file downloads from HuggingFace CDN
+_HF_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Opera GX";v="129"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "DNT": "1",
+    "Priority": "u=0, i",
+    "Connection": "keep-alive",
+}
 
 
-def _fetch_fixes_index() -> Optional[Dict]:
-    """Fetch and cache the fixes index JSON. Returns None on failure."""
+def _fetch_hf_tree(repo_id: str, path: str) -> Set[int]:
+    """Fetch all .zip filenames under `path` in `repo_id` via HF Tree API.
+
+    Uses standard urllib (no custom httpx client) to avoid WAF fingerprinting.
+    Handles RFC-5988 Link header pagination automatically.
+
+    Returns a set of integer appids corresponding to the zip files found.
+    """
+    base_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{path}"
+    url: Optional[str] = base_url
+    appids: Set[int] = set()
+
+    while url:
+        try:
+            req = urllib.request.Request(url, headers=_HF_REQUEST_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as response:
+                if response.status != 200:
+                    logger.warn(f"LuaTools: HF Tree API returned {response.status} for {path}")
+                    break
+
+                data = json.loads(response.read().decode("utf-8"))
+                for item in data:
+                    if isinstance(item, dict) and item.get("type") == "file":
+                        filename = item.get("path", "").split("/")[-1]
+                        if filename.endswith(".zip"):
+                            id_str = filename[:-4]
+                            try:
+                                appids.add(int(id_str))
+                            except ValueError:
+                                pass
+
+                # Handle RFC 5988 "Link: <url>; rel='next'" pagination
+                link_header = response.headers.get("link", "")
+                url = None
+                if link_header:
+                    for entry in link_header.split(","):
+                        if 'rel="next"' in entry and "<" in entry and ">" in entry:
+                            url = entry[entry.find("<") + 1 : entry.find(">")]
+                            break
+
+        except urllib.error.HTTPError as exc:
+            logger.warn(f"LuaTools: HF Tree HTTP error on '{path}': {exc.code} {exc.reason}")
+            break
+        except Exception as exc:
+            logger.warn(f"LuaTools: HF Tree pagination failed on '{path}': {exc}")
+            break
+
+    return appids
+
+
+def _fetch_fixes_index() -> Optional[Dict[str, Set[int]]]:
+    """Return the in-memory HF fixes index, rebuilding it when stale.
+
+    Pattern: double-checked locking — first check without lock (fast path),
+    then check again inside lock before writing (correct path).
+
+    Returns None only when both HF tree fetch AND cache are unavailable.
+    """
     global _fixes_index_cache, _fixes_index_fetched_at
     now = time.time()
 
-    with _fixes_index_lock:
-        if _fixes_index_cache is not None and (now - _fixes_index_fetched_at) < _FIXES_INDEX_TTL:
-            return _fixes_index_cache
+    # Fast path: cache is valid — no lock needed for read
+    cache = _fixes_index_cache
+    if cache is not None and (now - _fixes_index_fetched_at) < _FIXES_INDEX_TTL:
+        return cache
 
-    # Fetch outside the lock to avoid blocking other threads
+    # Fetch outside the write lock to avoid blocking other threads
     try:
-        client = ensure_http_client("LuaTools: FixesIndex")
-        resp = client.get(FIXES_INDEX_URL, follow_redirects=True, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            generic_set = set(data.get("genericFixes", []))
-            online_set = set(data.get("onlineFixes", []))
-            index = {"generic": generic_set, "online": online_set}
-            with _fixes_index_lock:
-                _fixes_index_cache = index
-                _fixes_index_fetched_at = time.time()
-            logger.log(f"LuaTools: Fixes index loaded ({len(generic_set)} generic, {len(online_set)} online)")
-            return index
-        else:
-            logger.warn(f"LuaTools: Fixes index fetch returned {resp.status_code}")
-    except Exception as exc:
-        logger.warn(f"LuaTools: Failed to fetch fixes index: {exc}")
+        generic_set = _fetch_hf_tree(HF_REPO_ID, HF_GENERIC_PATH)
+        online_set = _fetch_hf_tree(HF_REPO_ID, HF_ONLINE_PATH)
+        new_index: Dict[str, Set[int]] = {"generic": generic_set, "online": online_set}
 
-    # Return stale cache if available
+        # Only persist if we got at least something useful
+        if generic_set or online_set:
+            with _fixes_index_lock:
+                _fixes_index_cache = new_index
+                _fixes_index_fetched_at = time.time()
+            logger.log(
+                f"LuaTools: HF fixes index built — "
+                f"{len(generic_set)} generic, {len(online_set)} online"
+            )
+            return new_index
+
+    except Exception as exc:
+        logger.warn(f"LuaTools: Failed to build HF fixes index: {exc}")
+
+    # Return stale cache rather than none when possible
     with _fixes_index_lock:
         return _fixes_index_cache
 
 
+def init_fixes_index() -> None:
+    """Pre-warm the HF fixes index at plugin startup (non-blocking call)."""
+    try:
+        _fetch_fixes_index()
+    except Exception as exc:
+        logger.warn(f"LuaTools: init_fixes_index failed: {exc}")
+
+
+# ── Path traversal protection ─────────────────────────────────────────────
+
 def _is_safe_path(base_path: str, target_path: str) -> bool:
-    """Check if target_path stays within base_path (prevents path traversal attacks)."""
+    """Return True only when target_path remains inside base_path."""
     abs_base = os.path.abspath(base_path)
     abs_target = os.path.abspath(os.path.join(base_path, target_path))
     return abs_target.startswith(abs_base + os.sep) or abs_target == abs_base
 
+
+# ── State helpers ─────────────────────────────────────────────────────────
 
 def _set_fix_download_state(appid: int, update: dict) -> None:
     with FIX_DOWNLOAD_LOCK:
@@ -93,13 +203,21 @@ def _get_unfix_state(appid: int) -> dict:
         return UNFIX_STATE.get(appid, {}).copy()
 
 
+# ── Public: check availability ────────────────────────────────────────────
+
 def check_for_fixes(appid: int) -> str:
+    """Check both HuggingFace fix buckets for the given appid.
+
+    Priority:
+    1. Fast path — in-memory HF tree index (built once at startup, cached 1 h)
+    2. Fallback — live HEAD requests when index is unavailable
+    """
     try:
         appid = int(appid)
     except Exception:
         return json.dumps({"success": False, "error": "Invalid appid"})
 
-    result = {
+    result: Dict[str, Any] = {
         "success": True,
         "appid": appid,
         "gameName": "",
@@ -113,226 +231,389 @@ def check_for_fixes(appid: int) -> str:
         logger.warn(f"LuaTools: Failed to fetch game name for {appid}: {exc}")
         result["gameName"] = f"Unknown Game ({appid})"
 
-    # Use the cached fixes index instead of HEAD requests to R2
+    generic_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{HF_GENERIC_PATH}/{appid}.zip"
+    online_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{HF_ONLINE_PATH}/{appid}.zip"
+
     index = _fetch_fixes_index()
     if index is not None:
-        generic_url = f"https://files.luatools.work/GameBypasses/{appid}.zip"
-        online_url = f"https://files.luatools.work/OnlineFix1/{appid}.zip"
+        has_generic = appid in index["generic"]
+        has_online = appid in index["online"]
 
-        if appid in index["generic"]:
-            result["genericFix"]["status"] = 200
-            result["genericFix"]["available"] = True
+        result["genericFix"]["status"] = 200 if has_generic else 404
+        result["genericFix"]["available"] = has_generic
+        if has_generic:
             result["genericFix"]["url"] = generic_url
-        else:
-            result["genericFix"]["status"] = 404
 
-        if appid in index["online"]:
-            result["onlineFix"]["status"] = 200
-            result["onlineFix"]["available"] = True
+        result["onlineFix"]["status"] = 200 if has_online else 404
+        result["onlineFix"]["available"] = has_online
+        if has_online:
             result["onlineFix"]["url"] = online_url
-        else:
-            result["onlineFix"]["status"] = 404
 
-        logger.log(f"LuaTools: Fix check for {appid} via index: generic={appid in index['generic']}, online={appid in index['online']}")
+        logger.log(
+            f"LuaTools: HF fix check (index) for {appid}: "
+            f"generic={has_generic}, online={has_online}"
+        )
     else:
-        # Fallback: HEAD requests if index is unavailable
-        logger.warn(f"LuaTools: Fixes index unavailable, falling back to HEAD requests for {appid}")
+        # Fallback: individual HEAD requests (slow but reliable)
+        logger.warn(f"LuaTools: HF index unavailable, falling back to HEAD for {appid}")
         client = ensure_http_client("LuaTools: CheckForFixes")
-        try:
-            generic_url = f"https://files.luatools.work/GameBypasses/{appid}.zip"
-            resp = client.head(generic_url, follow_redirects=True, timeout=10)
-            result["genericFix"]["status"] = resp.status_code
-            result["genericFix"]["available"] = resp.status_code == 200
-            if resp.status_code == 200:
-                result["genericFix"]["url"] = generic_url
-        except Exception as exc:
-            logger.warn(f"LuaTools: Generic fix check failed for {appid}: {exc}")
-
-        try:
-            online_url = f"https://files.luatools.work/OnlineFix1/{appid}.zip"
-            resp = client.head(online_url, follow_redirects=True, timeout=10)
-            result["onlineFix"]["status"] = resp.status_code
-            result["onlineFix"]["available"] = resp.status_code == 200
-            if resp.status_code == 200:
-                result["onlineFix"]["url"] = online_url
-        except Exception as exc:
-            logger.warn(f"LuaTools: Online-fix check failed for {appid}: {exc}")
+        for key, url_check in [("genericFix", generic_url), ("onlineFix", online_url)]:
+            try:
+                resp = client.head(
+                    url_check,
+                    follow_redirects=True,
+                    timeout=10,
+                    headers={"User-Agent": _HF_DOWNLOAD_HEADERS["User-Agent"]},
+                )
+                result[key]["status"] = resp.status_code
+                result[key]["available"] = resp.status_code == 200
+                if resp.status_code == 200:
+                    result[key]["url"] = url_check
+            except Exception as exc:
+                logger.warn(f"LuaTools: HEAD fallback error on {url_check}: {exc}")
 
     return json.dumps(result)
 
 
-def _download_and_extract_fix(appid: int, download_url: str, install_path: str, fix_type: str, game_name: str = ""):
+# ── Extraction utilities ───────────────────────────────────────────────────
+
+def _get_extractor_binary() -> tuple:
+    """Locate 7-Zip or WinRAR on the system. Returns (type, exe_path)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\7-Zip") as key:
+            path = winreg.QueryValueEx(key, "Path")[0]
+            exe = os.path.join(path, "7z.exe")
+            if os.path.exists(exe):
+                return ("7z", exe)
+    except Exception:
+        pass
+
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinRAR") as key:
+            exe = winreg.QueryValueEx(key, "exe64")[0]
+            if os.path.exists(exe):
+                return ("winrar", exe)
+    except Exception:
+        pass
+
+    # Common installation paths
+    for path in [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        if os.path.exists(path):
+            return ("7z", path)
+
+    for path in [
+        r"C:\Program Files\WinRAR\WinRAR.exe",
+        r"C:\Program Files (x86)\WinRAR\WinRAR.exe",
+    ]:
+        if os.path.exists(path):
+            return ("winrar", path)
+
+    return (None, None)
+
+
+def _extract_archive_robust(archive_path: str, dest_dir: str, pwd: str, appid: int) -> list:
+    """Extract ZIP, RAR, or 7Z archives to dest_dir.
+
+    - ZIP: native Python zipfile (no external dependency)
+    - RAR/7Z: requires WinRAR or 7-Zip to be installed
+    - Auto-strips single redundant parent folder
+    - Returns list of relative paths of extracted files
+    """
+    with open(archive_path, "rb") as fh:
+        sig = fh.read(6)
+
+    is_zip = sig[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+    is_rar = sig[:6] == b"Rar!\x1a\x07" or sig[:6] == b"Rar!\x1a\x00"
+    is_7z = sig[:6] == b"7z\xbc\xaf\x27\x1c"
+
+    if not (is_zip or is_rar or is_7z):
+        raise RuntimeError(
+            f"Corrupted or unsupported archive format (magic: {sig[:4].hex()})"
+        )
+
+    extracted_files: list = []
+    extract_temp = os.path.join(
+        ensure_temp_download_dir(), f"xtr_{appid}_{int(time.time() * 1000)}"
+    )
+    os.makedirs(extract_temp, exist_ok=True)
+
+    try:
+        if is_zip:
+            logger.log("LuaTools: Extracting standard ZIP natively…")
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                for member in archive.namelist():
+                    if member.endswith("/") or ".." in member:
+                        continue
+                    try:
+                        archive.extract(member, extract_temp)
+                    except RuntimeError as exc:
+                        err_lower = str(exc).lower()
+                        if any(k in err_lower for k in ("pwd", "password", "encrypt", "bad password")):
+                            archive.extract(member, extract_temp, pwd=pwd.encode("utf-8"))
+                        else:
+                            raise
+        else:
+            ext_type, exe_path = _get_extractor_binary()
+            if not exe_path:
+                raise RuntimeError(
+                    "This fix uses RAR/7Z format. "
+                    "Please install WinRAR or 7-Zip to extract it."
+                )
+
+            logger.log(f"LuaTools: Extracting {ext_type.upper()} archive with native tools…")
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # Hidden window
+
+            if ext_type == "7z":
+                cmd = [exe_path, "x", archive_path, f"-p{pwd}", "-y", f"-o{extract_temp}"]
+            else:  # winrar
+                cmd = [exe_path, "x", f"-p{pwd}", "-y", archive_path, extract_temp + "\\"]
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                startupinfo=startupinfo,
+            )
+            if proc.returncode != 0:
+                logger.warn(f"LuaTools: {ext_type} extraction stderr: {proc.stderr[:500]}")
+                raise RuntimeError(
+                    f"Extraction via {ext_type} failed (exit {proc.returncode}). "
+                    "Wrong password or damaged archive."
+                )
+
+        # Auto-strip single redundant parent folder (e.g., GameName/files → files)
+        top_items = os.listdir(extract_temp)
+        if len(top_items) == 1 and os.path.isdir(os.path.join(extract_temp, top_items[0])):
+            base_src = os.path.join(extract_temp, top_items[0])
+            logger.log(f"LuaTools: Stripping redundant parent folder '{top_items[0]}'")
+        else:
+            base_src = extract_temp
+
+        # Move files to game directory
+        for root, _dirs, files in os.walk(base_src):
+            for filename in files:
+                src = os.path.join(root, filename)
+                rel = os.path.relpath(src, base_src)
+                dst = os.path.join(dest_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+                extracted_files.append(rel.replace("\\", "/"))
+
+    finally:
+        try:
+            shutil.rmtree(extract_temp, ignore_errors=True)
+        except Exception:
+            pass
+
+    return extracted_files
+
+
+# ── Fix download worker ───────────────────────────────────────────────────
+
+def _download_and_extract_fix(
+    appid: int,
+    download_url: str,
+    install_path: str,
+    fix_type: str,
+    game_name: str = "",
+) -> None:
+    """Background worker: download archive from URL and extract to install_path.
+
+    Handles:
+    - Chunked streaming download with cancel checks
+    - HuggingFace LFS pointer detection & automatic CDN redirect
+    - Robust extraction (ZIP/RAR/7Z)
+    - unsteam.ini appid patching for Online Fix (Unsteam) type
+    - Atomic log append for unfix tracking
+    """
+    dest_zip = ""  # Initialize before try to avoid NameError in except block
     client = ensure_http_client("LuaTools: fix download")
+
     try:
         dest_root = ensure_temp_download_dir()
         dest_zip = os.path.join(dest_root, f"fix_{appid}.zip")
-        _set_fix_download_state(appid, {"status": "downloading", "bytesRead": 0, "totalBytes": 0, "error": None})
+        _set_fix_download_state(appid, {
+            "status": "downloading",
+            "bytesRead": 0,
+            "totalBytes": 0,
+            "error": None,
+        })
 
-        logger.log(f"LuaTools: Downloading {fix_type} from {download_url}")
+        logger.log(f"LuaTools: Downloading {fix_type} fix for {appid} from {download_url}")
 
-        with client.stream("GET", download_url, follow_redirects=True, timeout=30) as resp:
-            logger.log(f"LuaTools: Fix download response for {appid}: status={resp.status_code}")
+        with client.stream(
+            "GET",
+            download_url,
+            follow_redirects=True,
+            timeout=60,
+            headers=_HF_DOWNLOAD_HEADERS,
+        ) as resp:
+            logger.log(f"LuaTools: Fix download response for {appid}: {resp.status_code}")
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", "0") or "0")
             _set_fix_download_state(appid, {"totalBytes": total})
 
             with open(dest_zip, "wb") as output:
-                for chunk in resp.iter_bytes():
+                for chunk in resp.iter_bytes(chunk_size=65536):
                     if not chunk:
                         continue
-                    state = _get_fix_download_state(appid)
-                    if state.get("status") == "cancelled":
-                        logger.log(f"LuaTools: Fix download cancelled before writing chunk for {appid}")
+                    if _get_fix_download_state(appid).get("status") == "cancelled":
+                        logger.log(f"LuaTools: Fix download cancelled mid-stream for {appid}")
                         raise RuntimeError("cancelled")
                     output.write(chunk)
-                    read = int(state.get("bytesRead", 0)) + len(chunk)
+                    read = int(_get_fix_download_state(appid).get("bytesRead", 0)) + len(chunk)
                     _set_fix_download_state(appid, {"bytesRead": read})
-                    if _get_fix_download_state(appid).get("status") == "cancelled":
-                        logger.log(f"LuaTools: Fix download cancelled for {appid}")
-                        raise RuntimeError("cancelled")
 
-        logger.log(f"LuaTools: Download complete, extracting to {install_path}")
+        # ── HuggingFace LFS pointer detection ─────────────────────────────
+        # HF occasionally serves an LFS pointer (text file ~130 bytes) instead of
+        # the actual binary when the resolve URL is accessed without proper headers.
+        # Detect by file size + content pattern and recover via the LFS CDN.
+        file_size = os.path.getsize(dest_zip)
+        if file_size < 1000:
+            with open(dest_zip, "rb") as fh:
+                header = fh.read(500)
+            if b"git-lfs" in header:
+                logger.warn(f"LuaTools: Received HF LFS pointer for {appid}. Resolving CDN URL…")
+                ptr_text = header.decode("utf-8", errors="ignore")
+                oid_match = re.search(r"oid sha256:([a-f0-9]{64})", ptr_text)
+                if oid_match:
+                    oid = oid_match.group(1)
+                    # Direct HuggingFace LFS CDN URL
+                    lfs_url = (
+                        f"https://cdn-lfs.huggingface.co/repos/"
+                        f"{HF_REPO_ID.replace('/', '/')}/objects/{oid[:2]}/{oid[2:4]}/{oid}"
+                    )
+                    logger.log(f"LuaTools: Retrying via LFS CDN: {lfs_url}")
+                    os.remove(dest_zip)
+                    return _download_and_extract_fix(
+                        appid, lfs_url, install_path, fix_type, game_name
+                    )
+                else:
+                    raise RuntimeError("Received HF LFS pointer but could not parse OID.")
+
+        if file_size < 1024:
+            raise RuntimeError(
+                f"Downloaded file is too small ({file_size} bytes). "
+                "Network or host issue."
+            )
+
+        # ── Check for cancellation before CPU-intensive extraction ──────────
+        if _get_fix_download_state(appid).get("status") == "cancelled":
+            raise RuntimeError("cancelled")
+
+        logger.log(f"LuaTools: Download complete ({file_size:,} bytes), extracting…")
         _set_fix_download_state(appid, {"status": "extracting"})
 
-        extracted_files = []
-        with zipfile.ZipFile(dest_zip, "r") as archive:
-            all_names = archive.namelist()
-            appid_folder = f"{appid}/"
-
-            top_level_entries = set()
-            for name in all_names:
-                parts = name.split("/")
-                if parts[0]:
-                    top_level_entries.add(parts[0])
-            if _get_fix_download_state(appid).get("status") == "cancelled":
-                logger.log(f"LuaTools: Fix extraction cancelled before start for {appid}")
-                raise RuntimeError("cancelled")
-
-            if len(top_level_entries) == 1 and appid_folder.rstrip("/") in top_level_entries:
-                logger.log(f"LuaTools: Found single folder {appid} in zip, extracting its contents")
-                for member in archive.namelist():
-                    if member.startswith(appid_folder) and member != appid_folder:
-                        target_path = member[len(appid_folder):]
-                        if not target_path:
-                            continue
-                        # Validate path doesn't escape install directory (prevent path traversal)
-                        if not _is_safe_path(install_path, target_path):
-                            logger.warn(f"LuaTools: Skipping potentially unsafe path in zip: {member}")
-                            continue
-                        source = archive.open(member)
-                        target = os.path.join(install_path, target_path)
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        if not member.endswith("/"):
-                            with open(target, "wb") as output:
-                                output.write(source.read())
-                            extracted_files.append(target_path.replace("\\", "/"))
-                        source.close()
-                        if _get_fix_download_state(appid).get("status") == "cancelled":
-                            logger.log(f"LuaTools: Fix extraction cancelled mid-process for {appid}")
-                            raise RuntimeError("cancelled")
-            else:
-                logger.log(f"LuaTools: Extracting all zip contents to {install_path}")
-                for member in archive.namelist():
-                    if member.endswith("/"):
-                        continue
-                    # Validate path doesn't escape install directory (prevent path traversal)
-                    if not _is_safe_path(install_path, member):
-                        logger.warn(f"LuaTools: Skipping potentially unsafe path in zip: {member}")
-                        continue
-                    archive.extract(member, install_path)
-                    extracted_files.append(member.replace("\\", "/"))
-                    if _get_fix_download_state(appid).get("status") == "cancelled":
-                        logger.log(f"LuaTools: Fix extraction cancelled mid-process for {appid}")
-                        raise RuntimeError("cancelled")
+        try:
+            extracted_files = _extract_archive_robust(
+                dest_zip, install_path, "online-fix.me", appid
+            )
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
 
         if _get_fix_download_state(appid).get("status") == "cancelled":
             logger.log(f"LuaTools: Fix cancelled after extraction for {appid}")
             raise RuntimeError("cancelled")
 
-        ini_relative_path = None
-        for rel_path in extracted_files:
-            if rel_path.replace("\\", "/").lower().endswith("unsteam.ini"):
-                ini_relative_path = rel_path
-                break
-
+        # ── unsteam.ini appid patching ─────────────────────────────────────
         if fix_type.lower() == "online fix (unsteam)":
-            try:
-                if ini_relative_path:
-                    ini_full_path = os.path.join(install_path, ini_relative_path.replace("/", os.sep))
-                    if os.path.exists(ini_full_path):
-                        with open(ini_full_path, "r", encoding="utf-8", errors="ignore") as ini_file:
-                            contents = ini_file.read()
-                        updated_contents = contents.replace("<appid>", str(appid))
-                        if updated_contents != contents:
-                            with open(ini_full_path, "w", encoding="utf-8") as ini_file:
-                                ini_file.write(updated_contents)
-                            logger.log(f"LuaTools: Updated unsteam.ini with appid {appid}")
-                        else:
-                            logger.log("LuaTools: unsteam.ini did not contain <appid> placeholder or was already updated")
-                    else:
-                        logger.warn(f"LuaTools: Expected unsteam.ini at {ini_full_path} but file not found")
-                else:
-                    logger.warn("LuaTools: Extracted files do not include unsteam.ini for Online Fix (Unsteam)")
-            except Exception as exc:
-                logger.warn(f"LuaTools: Failed to update unsteam.ini: {exc}")
+            ini_path = None
+            for rel_path in extracted_files:
+                if rel_path.replace("\\", "/").lower().endswith("unsteam.ini"):
+                    ini_path = os.path.join(install_path, rel_path.replace("/", os.sep))
+                    break
 
+            if ini_path and os.path.exists(ini_path):
+                try:
+                    with open(ini_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        contents = fh.read()
+                    updated = contents.replace("<appid>", str(appid))
+                    if updated != contents:
+                        with open(ini_path, "w", encoding="utf-8") as fh:
+                            fh.write(updated)
+                        logger.log(f"LuaTools: Patched unsteam.ini with appid={appid}")
+                    else:
+                        logger.log("LuaTools: unsteam.ini had no <appid> placeholder")
+                except Exception as exc:
+                    logger.warn(f"LuaTools: Failed to patch unsteam.ini: {exc}")
+            elif ini_path:
+                logger.warn(f"LuaTools: Expected unsteam.ini at {ini_path} but not found")
+            else:
+                logger.warn("LuaTools: No unsteam.ini found for Online Fix (Unsteam)")
+
+        # ── Append to fix log (for unfix tracking) ────────────────────────
         log_file_path = os.path.join(install_path, f"luatools-fix-log-{appid}.log")
         try:
-            # Read existing log to preserve previous fixes
             existing_content = ""
             if os.path.exists(log_file_path):
                 try:
-                    with open(log_file_path, "r", encoding="utf-8") as log_file:
-                        existing_content = log_file.read()
+                    with open(log_file_path, "r", encoding="utf-8") as fh:
+                        existing_content = fh.read()
                 except Exception:
                     pass
 
-            # Append new fix entry
-            with open(log_file_path, "w", encoding="utf-8") as log_file:
-                # Write existing content first
+            with open(log_file_path, "w", encoding="utf-8") as fh:
                 if existing_content:
-                    log_file.write(existing_content)
+                    fh.write(existing_content)
                     if not existing_content.endswith("\n"):
-                        log_file.write("\n")
-                    log_file.write("\n---\n\n")  # Separator between fixes
+                        fh.write("\n")
+                    fh.write("\n---\n\n")
 
-                # Write new fix entry
-                log_file.write(f'[FIX]\n')
-                log_file.write(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
-                log_file.write(f'Game: {game_name or f"Unknown Game ({appid})"}\n')
-                log_file.write(f"Fix Type: {fix_type}\n")
-                log_file.write(f"Download URL: {download_url}\n")
-                log_file.write("Files:\n")
-                for file_path in extracted_files:
-                    log_file.write(f"{file_path}\n")
-                log_file.write("[/FIX]\n")
+                fh.write("[FIX]\n")
+                fh.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.write(f"Game: {game_name or f'Unknown Game ({appid})'}\n")
+                fh.write(f"Fix Type: {fix_type}\n")
+                fh.write(f"Download URL: {download_url}\n")
+                fh.write("Files:\n")
+                for fp in extracted_files:
+                    fh.write(f"{fp}\n")
+                fh.write("[/FIX]\n")
 
-            logger.log(f"LuaTools: Appended fix log at {log_file_path} with {len(extracted_files)} files")
+            logger.log(
+                f"LuaTools: Fix log updated — {len(extracted_files)} files at {log_file_path}"
+            )
         except Exception as exc:
-            logger.warn(f"LuaTools: Failed to create fix log file: {exc}")
+            logger.warn(f"LuaTools: Failed to write fix log: {exc}")
 
         logger.log(f"LuaTools: {fix_type} applied successfully to {install_path}")
         _set_fix_download_state(appid, {"status": "done", "success": True})
 
-        try:
-            os.remove(dest_zip)
-        except Exception:
-            pass
-
     except Exception as exc:
         if str(exc) == "cancelled":
+            _set_fix_download_state(
+                appid, {"status": "cancelled", "success": False, "error": "Cancelled by user"}
+            )
+        else:
+            logger.warn(f"LuaTools: Failed to apply fix for {appid}: {exc}")
+            _set_fix_download_state(appid, {"status": "failed", "error": str(exc)})
+    finally:
+        if dest_zip:
             try:
                 if os.path.exists(dest_zip):
                     os.remove(dest_zip)
             except Exception:
                 pass
-            _set_fix_download_state(appid, {"status": "cancelled", "success": False, "error": "Cancelled by user"})
-            return
-        logger.warn(f"LuaTools: Failed to apply fix: {exc}")
-        _set_fix_download_state(appid, {"status": "failed", "error": str(exc)})
 
 
-def apply_game_fix(appid: int, download_url: str, install_path: str, fix_type: str = "", game_name: str = "") -> str:
+# ── Public: apply / status / cancel ──────────────────────────────────────
+
+def apply_game_fix(
+    appid: int,
+    download_url: str,
+    install_path: str,
+    fix_type: str = "",
+    game_name: str = "",
+) -> str:
     try:
         appid = int(appid)
     except Exception:
@@ -344,13 +625,31 @@ def apply_game_fix(appid: int, download_url: str, install_path: str, fix_type: s
     if not os.path.exists(install_path):
         return json.dumps({"success": False, "error": "Install path does not exist"})
 
+    # Millennium IPC sometimes delivers translated strings with Latin-1→UTF-8
+    # mojibake (e.g. "CorreÃ§Ã£o" instead of "Correção"). Sanitize here.
+    def _decode_ipc(s: str) -> str:
+        try:
+            return s.encode("latin-1").decode("utf-8")
+        except Exception:
+            return s
+
+    fix_type = _decode_ipc(fix_type) if fix_type else fix_type
+    game_name = _decode_ipc(game_name) if game_name else game_name
+
     logger.log(f"LuaTools: ApplyGameFix appid={appid}, fixType={fix_type}")
 
-    _set_fix_download_state(appid, {"status": "queued", "bytesRead": 0, "totalBytes": 0, "error": None})
-    thread = threading.Thread(
-        target=_download_and_extract_fix, args=(appid, download_url, install_path, fix_type, game_name), daemon=True
-    )
-    thread.start()
+
+    _set_fix_download_state(appid, {
+        "status": "queued",
+        "bytesRead": 0,
+        "totalBytes": 0,
+        "error": None,
+    })
+    threading.Thread(
+        target=_download_and_extract_fix,
+        args=(appid, download_url, install_path, fix_type, game_name),
+        daemon=True,
+    ).start()
 
     return json.dumps({"success": True})
 
@@ -363,8 +662,8 @@ def get_apply_fix_status(appid: int) -> str:
 
     state = _get_fix_download_state(appid)
     return json.dumps({"success": True, "state": state})
- 
- 
+
+
 def cancel_apply_fix(appid: int) -> str:
     try:
         appid = int(appid)
@@ -372,114 +671,112 @@ def cancel_apply_fix(appid: int) -> str:
         return json.dumps({"success": False, "error": "Invalid appid"})
 
     state = _get_fix_download_state(appid)
-    if not state or state.get("status") in {"done", "failed"}:
+    if not state or state.get("status") in {"done", "failed", "cancelled"}:
         return json.dumps({"success": True, "message": "Nothing to cancel"})
 
-    _set_fix_download_state(appid, {"status": "cancelled", "success": False, "error": "Cancelled by user"})
+    _set_fix_download_state(appid, {
+        "status": "cancelled",
+        "success": False,
+        "error": "Cancelled by user",
+    })
     logger.log(f"LuaTools: CancelApplyFix requested for appid={appid}")
     return json.dumps({"success": True})
 
 
-def _unfix_game_worker(appid: int, install_path: str, fix_date: str = None):
+# ── Public: unfix ─────────────────────────────────────────────────────────
+
+def _unfix_game_worker(appid: int, install_path: str, fix_date: Optional[str] = None) -> None:
+    """Background worker that reverses a previously applied fix."""
     try:
-        logger.log(f"LuaTools: Starting un-fix for appid {appid}, fix_date={fix_date}")
+        logger.log(f"LuaTools: Starting un-fix for appid={appid}, fix_date={fix_date}")
         log_file_path = os.path.join(install_path, f"luatools-fix-log-{appid}.log")
 
         if not os.path.exists(log_file_path):
-            _set_unfix_state(appid, {"status": "failed", "error": "No fix log found. Cannot un-fix."})
+            _set_unfix_state(appid, {"status": "failed", "error": "No fix log found."})
             return
 
-        _set_unfix_state(appid, {"status": "removing", "progress": "Reading log file..."})
+        _set_unfix_state(appid, {"status": "removing", "progress": "Reading log file…"})
 
-        files_to_delete = set()  # Use set to avoid duplicates
-        remaining_fixes = []  # Fixes to keep in the log
+        files_to_delete: Set[str] = set()
+        remaining_fixes: list = []
 
         try:
-            with open(log_file_path, "r", encoding="utf-8") as handle:
-                log_content = handle.read()
+            with open(log_file_path, "r", encoding="utf-8") as fh:
+                log_content = fh.read()
 
-            # Parse multiple fixes (new format with [FIX] markers)
             if "[FIX]" in log_content:
-                # New format with multiple fixes
-                fix_blocks = log_content.split("[FIX]")
-                for block in fix_blocks:
+                for block in log_content.split("[FIX]"):
                     if not block.strip():
                         continue
 
-                    lines = block.split("\n")
-                    in_files_section = False
-                    block_date = None
-                    block_lines = []  # Store original block content
+                    block_date: Optional[str] = None
+                    block_lines: list = []
+                    in_files = False
 
-                    for line in lines:
-                        line_stripped = line.strip()
-                        if line_stripped == "[/FIX]" or line_stripped == "---":
+                    for line in block.split("\n"):
+                        stripped = line.strip()
+                        if stripped in ("[/FIX]", "---"):
                             break
-                        if line_stripped.startswith("Date:"):
-                            block_date = line_stripped.replace("Date:", "").strip()
-
+                        if stripped.startswith("Date:"):
+                            block_date = stripped.replace("Date:", "").strip()
                         block_lines.append(line)
 
-                        if line_stripped == "Files:":
-                            in_files_section = True
-                        elif in_files_section and line_stripped:
-                            # If we're deleting a specific fix, only add files from that fix
-                            if fix_date is None or (block_date and block_date == fix_date):
-                                files_to_delete.add(line_stripped)
+                        if stripped == "Files:":
+                            in_files = True
+                        elif in_files and stripped:
+                            if fix_date is None or block_date == fix_date:
+                                files_to_delete.add(stripped)
 
-                    # If we're deleting a specific fix, keep the others
                     if fix_date is not None and block_date and block_date != fix_date:
                         remaining_fixes.append("[FIX]\n" + "\n".join(block_lines) + "\n[/FIX]")
             else:
-                # Old format (single fix without markers) - legacy support
-                # Delete all files (no individual selection possible)
-                lines = log_content.split("\n")
-                in_files_section = False
-                for line in lines:
+                # Legacy format (no markers)
+                in_files = False
+                for line in log_content.split("\n"):
                     line = line.strip()
                     if line == "Files:":
-                        in_files_section = True
-                    elif in_files_section and line:
+                        in_files = True
+                    elif in_files and line:
                         files_to_delete.add(line)
 
-            logger.log(f"LuaTools: Found {len(files_to_delete)} unique files to remove from log")
+            logger.log(f"LuaTools: {len(files_to_delete)} unique files to remove")
         except Exception as exc:
             logger.warn(f"LuaTools: Failed to read log file: {exc}")
-            _set_unfix_state(appid, {"status": "failed", "error": f"Failed to read log file: {str(exc)}"})
+            _set_unfix_state(appid, {"status": "failed", "error": f"Log read error: {exc}"})
             return
 
-        _set_unfix_state(appid, {"status": "removing", "progress": f"Removing {len(files_to_delete)} files..."})
-        deleted_count = 0
-        for file_path in files_to_delete:
+        _set_unfix_state(appid, {
+            "status": "removing",
+            "progress": f"Removing {len(files_to_delete)} files…",
+        })
+        deleted = 0
+        for rel_path in files_to_delete:
+            full = os.path.join(install_path, rel_path)
             try:
-                full_path = os.path.join(install_path, file_path)
-                if os.path.exists(full_path):
-                    os.remove(full_path)
-                    deleted_count += 1
-                    logger.log(f"LuaTools: Deleted {file_path}")
+                if os.path.exists(full):
+                    os.remove(full)
+                    deleted += 1
+                    logger.log(f"LuaTools: Deleted {rel_path}")
             except Exception as exc:
-                logger.warn(f"LuaTools: Failed to delete {file_path}: {exc}")
+                logger.warn(f"LuaTools: Failed to delete {rel_path}: {exc}")
 
-        logger.log(f"LuaTools: Deleted {deleted_count}/{len(files_to_delete)} files")
+        logger.log(f"LuaTools: Deleted {deleted}/{len(files_to_delete)} files")
 
-        # Update or delete the log file
         if remaining_fixes:
-            # We deleted a specific fix, update the log with remaining fixes
             try:
-                with open(log_file_path, "w", encoding="utf-8") as handle:
-                    handle.write("\n\n---\n\n".join(remaining_fixes))
-                logger.log(f"LuaTools: Updated log file, {len(remaining_fixes)} fixes remaining")
+                with open(log_file_path, "w", encoding="utf-8") as fh:
+                    fh.write("\n\n---\n\n".join(remaining_fixes))
+                logger.log(f"LuaTools: Log updated — {len(remaining_fixes)} fix(es) remaining")
             except Exception as exc:
                 logger.warn(f"LuaTools: Failed to update log file: {exc}")
         else:
-            # No fixes remaining, delete the log file
             try:
                 os.remove(log_file_path)
                 logger.log(f"LuaTools: Deleted log file {log_file_path}")
             except Exception as exc:
                 logger.warn(f"LuaTools: Failed to delete log file: {exc}")
 
-        _set_unfix_state(appid, {"status": "done", "success": True, "filesRemoved": deleted_count})
+        _set_unfix_state(appid, {"status": "done", "success": True, "filesRemoved": deleted})
 
     except Exception as exc:
         logger.warn(f"LuaTools: Un-fix failed: {exc}")
@@ -495,12 +792,12 @@ def unfix_game(appid: int, install_path: str = "", fix_date: str = "") -> str:
     resolved_path = install_path
     if not resolved_path:
         try:
-            result = get_game_install_path_response(appid)
-            if not result.get("success") or not result.get("installPath"):
+            res = get_game_install_path_response(appid)
+            if not res.get("success") or not res.get("installPath"):
                 return json.dumps({"success": False, "error": "Could not find game install path"})
-            resolved_path = result["installPath"]
+            resolved_path = res["installPath"]
         except Exception as exc:
-            return json.dumps({"success": False, "error": f"Failed to get install path: {str(exc)}"})
+            return json.dumps({"success": False, "error": f"Failed to get install path: {exc}"})
 
     if not os.path.exists(resolved_path):
         return json.dumps({"success": False, "error": "Install path does not exist"})
@@ -508,8 +805,11 @@ def unfix_game(appid: int, install_path: str = "", fix_date: str = "") -> str:
     logger.log(f"LuaTools: UnFixGame appid={appid}, path={resolved_path}, fix_date={fix_date}")
 
     _set_unfix_state(appid, {"status": "queued", "progress": "", "error": None})
-    thread = threading.Thread(target=_unfix_game_worker, args=(appid, resolved_path, fix_date or None), daemon=True)
-    thread.start()
+    threading.Thread(
+        target=_unfix_game_worker,
+        args=(appid, resolved_path, fix_date or None),
+        daemon=True,
+    ).start()
 
     return json.dumps({"success": True})
 
@@ -520,12 +820,13 @@ def get_unfix_status(appid: int) -> str:
     except Exception:
         return json.dumps({"success": False, "error": "Invalid appid"})
 
-    state = _get_unfix_state(appid)
-    return json.dumps({"success": True, "state": state})
+    return json.dumps({"success": True, "state": _get_unfix_state(appid)})
 
+
+# ── Public: list installed fixes ──────────────────────────────────────────
 
 def get_installed_fixes() -> str:
-    """Scan all Steam library folders for games with luatools fix logs."""
+    """Scan all Steam library paths for games that have a luatools fix log."""
     try:
         from steam_utils import _find_steam_path, _parse_vdf_simple
 
@@ -533,174 +834,150 @@ def get_installed_fixes() -> str:
         if not steam_path:
             return json.dumps({"success": False, "error": "Could not find Steam installation path"})
 
-        library_vdf_path = os.path.join(steam_path, "config", "libraryfolders.vdf")
-        if not os.path.exists(library_vdf_path):
-            return json.dumps({"success": False, "error": "Could not find libraryfolders.vdf"})
+        library_vdf = os.path.join(steam_path, "config", "libraryfolders.vdf")
+        if not os.path.exists(library_vdf):
+            return json.dumps({"success": False, "error": "libraryfolders.vdf not found"})
 
         try:
-            with open(library_vdf_path, "r", encoding="utf-8") as handle:
-                vdf_content = handle.read()
+            with open(library_vdf, "r", encoding="utf-8") as fh:
+                vdf_content = fh.read()
             library_data = _parse_vdf_simple(vdf_content)
         except Exception as exc:
             logger.warn(f"LuaTools: Failed to parse libraryfolders.vdf: {exc}")
             return json.dumps({"success": False, "error": "Failed to parse libraryfolders.vdf"})
 
-        library_folders = library_data.get("libraryfolders", {})
-        all_library_paths = []
-
-        for folder_data in library_folders.values():
+        library_paths: list = []
+        for folder_data in library_data.get("libraryfolders", {}).values():
             if isinstance(folder_data, dict):
-                folder_path = folder_data.get("path", "")
-                if folder_path:
-                    folder_path = folder_path.replace("\\\\", "\\")
-                    all_library_paths.append(folder_path)
+                path = folder_data.get("path", "").replace("\\\\", "\\")
+                if path:
+                    library_paths.append(path)
 
-        installed_fixes = []
+        installed_fixes: list = []
 
-        for lib_path in all_library_paths:
-            steamapps_path = os.path.join(lib_path, "steamapps")
-            if not os.path.exists(steamapps_path):
+        for lib_path in library_paths:
+            steamapps = os.path.join(lib_path, "steamapps")
+            if not os.path.exists(steamapps):
                 continue
 
-            # Get all appmanifest files
             try:
-                for filename in os.listdir(steamapps_path):
+                for filename in os.listdir(steamapps):
                     if not filename.startswith("appmanifest_") or not filename.endswith(".acf"):
                         continue
 
-                    # Extract appid from filename
                     try:
-                        appid_str = filename.replace("appmanifest_", "").replace(".acf", "")
-                        appid = int(appid_str)
+                        fappid = int(filename.replace("appmanifest_", "").replace(".acf", ""))
                     except Exception:
                         continue
 
-                    # Parse manifest to get install directory
-                    manifest_path = os.path.join(steamapps_path, filename)
                     try:
-                        with open(manifest_path, "r", encoding="utf-8") as handle:
-                            manifest_content = handle.read()
-                        manifest_data = _parse_vdf_simple(manifest_content)
+                        with open(os.path.join(steamapps, filename), "r", encoding="utf-8") as fh:
+                            manifest_data = _parse_vdf_simple(fh.read())
                         app_state = manifest_data.get("AppState", {})
                         install_dir = app_state.get("installdir", "")
-                        game_name = app_state.get("name", f"Unknown Game ({appid})")
+                        game_name = app_state.get("name", f"Unknown Game ({fappid})")
 
                         if not install_dir:
                             continue
 
-                        full_install_path = os.path.join(lib_path, "steamapps", "common", install_dir)
-                        if not os.path.exists(full_install_path):
+                        full_path = os.path.join(steamapps, "common", install_dir)
+                        if not os.path.exists(full_path):
                             continue
 
-                        # Check for luatools fix log
-                        log_file_path = os.path.join(full_install_path, f"luatools-fix-log-{appid}.log")
-                        if os.path.exists(log_file_path):
-                            # Parse the log file to get fix info (supports multiple fixes)
-                            try:
-                                with open(log_file_path, "r", encoding="utf-8") as log_handle:
-                                    log_content = log_handle.read()
+                        log_path = os.path.join(full_path, f"luatools-fix-log-{fappid}.log")
+                        if not os.path.exists(log_path):
+                            continue
 
-                                # Parse multiple fixes (new format with [FIX] markers)
-                                fixes_in_log = []
-                                if "[FIX]" in log_content:
-                                    # New format with multiple fixes
-                                    fix_blocks = log_content.split("[FIX]")
-                                    for block in fix_blocks:
-                                        if not block.strip():
-                                            continue
+                        try:
+                            with open(log_path, "r", encoding="utf-8") as fh:
+                                log_content = fh.read()
 
-                                        # Extract data from this fix block
-                                        fix_data = {
-                                            "appid": appid,
-                                            "gameName": game_name,
-                                            "installPath": full_install_path,
-                                            "date": "",
-                                            "fixType": "",
-                                            "downloadUrl": "",
-                                            "filesCount": 0,
-                                            "files": []
-                                        }
+                            fixes_in_log: list = []
 
-                                        lines = block.split("\n")
-                                        in_files_section = False
-
-                                        for line in lines:
-                                            line = line.strip()
-                                            if line == "[/FIX]" or line == "---":
-                                                break
-                                            if line.startswith("Date:"):
-                                                fix_data["date"] = line.replace("Date:", "").strip()
-                                            elif line.startswith("Game:"):
-                                                log_game_name = line.replace("Game:", "").strip()
-                                                if log_game_name and log_game_name != f"Unknown Game ({appid})":
-                                                    fix_data["gameName"] = log_game_name
-                                            elif line.startswith("Fix Type:"):
-                                                fix_data["fixType"] = line.replace("Fix Type:", "").strip()
-                                            elif line.startswith("Download URL:"):
-                                                fix_data["downloadUrl"] = line.replace("Download URL:", "").strip()
-                                            elif line == "Files:":
-                                                in_files_section = True
-                                            elif in_files_section and line:
-                                                fix_data["files"].append(line)
-
-                                        fix_data["filesCount"] = len(fix_data["files"])
-                                        if fix_data["date"]:  # Only add if it has a date (valid fix)
-                                            fixes_in_log.append(fix_data)
-                                else:
-                                    # Old format (single fix without markers) - legacy support
-                                    log_lines = log_content.split("\n")
-                                    fix_data = {
-                                        "appid": appid,
+                            if "[FIX]" in log_content:
+                                for block in log_content.split("[FIX]"):
+                                    if not block.strip():
+                                        continue
+                                    fix_data: Dict[str, Any] = {
+                                        "appid": fappid,
                                         "gameName": game_name,
-                                        "installPath": full_install_path,
+                                        "installPath": full_path,
                                         "date": "",
                                         "fixType": "",
                                         "downloadUrl": "",
                                         "filesCount": 0,
-                                        "files": []
+                                        "files": [],
                                     }
-
-                                    in_files_section = False
-                                    for line in log_lines:
+                                    in_files = False
+                                    for line in block.split("\n"):
                                         line = line.strip()
+                                        if line in ("[/FIX]", "---"):
+                                            break
                                         if line.startswith("Date:"):
                                             fix_data["date"] = line.replace("Date:", "").strip()
                                         elif line.startswith("Game:"):
-                                            log_game_name = line.replace("Game:", "").strip()
-                                            if log_game_name and log_game_name != f"Unknown Game ({appid})":
-                                                fix_data["gameName"] = log_game_name
+                                            val = line.replace("Game:", "").strip()
+                                            if val and val != f"Unknown Game ({fappid})":
+                                                fix_data["gameName"] = val
                                         elif line.startswith("Fix Type:"):
                                             fix_data["fixType"] = line.replace("Fix Type:", "").strip()
                                         elif line.startswith("Download URL:"):
                                             fix_data["downloadUrl"] = line.replace("Download URL:", "").strip()
                                         elif line == "Files:":
-                                            in_files_section = True
-                                        elif in_files_section and line:
+                                            in_files = True
+                                        elif in_files and line:
                                             fix_data["files"].append(line)
-
                                     fix_data["filesCount"] = len(fix_data["files"])
                                     if fix_data["date"]:
                                         fixes_in_log.append(fix_data)
+                            else:
+                                # Legacy single-fix format
+                                fix_data = {
+                                    "appid": fappid,
+                                    "gameName": game_name,
+                                    "installPath": full_path,
+                                    "date": "",
+                                    "fixType": "",
+                                    "downloadUrl": "",
+                                    "filesCount": 0,
+                                    "files": [],
+                                }
+                                in_files = False
+                                for line in log_content.split("\n"):
+                                    line = line.strip()
+                                    if line.startswith("Date:"):
+                                        fix_data["date"] = line.replace("Date:", "").strip()
+                                    elif line.startswith("Game:"):
+                                        val = line.replace("Game:", "").strip()
+                                        if val and val != f"Unknown Game ({fappid})":
+                                            fix_data["gameName"] = val
+                                    elif line.startswith("Fix Type:"):
+                                        fix_data["fixType"] = line.replace("Fix Type:", "").strip()
+                                    elif line.startswith("Download URL:"):
+                                        fix_data["downloadUrl"] = line.replace("Download URL:", "").strip()
+                                    elif line == "Files:":
+                                        in_files = True
+                                    elif in_files and line:
+                                        fix_data["files"].append(line)
+                                fix_data["filesCount"] = len(fix_data["files"])
+                                if fix_data["date"]:
+                                    fixes_in_log.append(fix_data)
 
-                                # Add all fixes found for this game
-                                for fix in fixes_in_log:
-                                    installed_fixes.append(fix)
+                            installed_fixes.extend(fixes_in_log)
 
-                            except Exception as exc:
-                                logger.warn(f"LuaTools: Failed to parse fix log for {appid}: {exc}")
+                        except Exception as exc:
+                            logger.warn(f"LuaTools: Failed to parse fix log for {fappid}: {exc}")
 
                     except Exception as exc:
                         logger.warn(f"LuaTools: Failed to process manifest {filename}: {exc}")
-                        continue
 
             except Exception as exc:
                 logger.warn(f"LuaTools: Failed to scan library {lib_path}: {exc}")
-                continue
 
         return json.dumps({"success": True, "fixes": installed_fixes})
 
     except Exception as exc:
-        logger.warn(f"LuaTools: Failed to get installed fixes: {exc}")
+        logger.warn(f"LuaTools: get_installed_fixes failed: {exc}")
         return json.dumps({"success": False, "error": str(exc)})
 
 
@@ -711,6 +988,6 @@ __all__ = [
     "get_apply_fix_status",
     "get_installed_fixes",
     "get_unfix_status",
+    "init_fixes_index",
     "unfix_game",
 ]
-

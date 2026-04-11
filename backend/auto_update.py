@@ -31,6 +31,31 @@ from utils import (
 _UPDATE_CHECK_THREAD: Optional[threading.Thread] = None
 
 
+def _is_safe_extract_path(base_path: str, member_path: str) -> bool:
+    """Verify that a zip member path does not escape the target directory."""
+    abs_base = os.path.abspath(base_path)
+    abs_target = os.path.abspath(os.path.join(base_path, member_path))
+    return abs_target.startswith(abs_base + os.sep) or abs_target == abs_base
+
+
+def _safe_extract_zip(archive: zipfile.ZipFile, target_dir: str) -> int:
+    """Extract all members from archive to target_dir, skipping unsafe paths.
+    
+    Returns the number of extracted files.
+    """
+    extracted = 0
+    for member in archive.namelist():
+        if member.endswith("/"):
+            continue  # skip pure directories
+        normalized = member.replace("\\", "/")
+        if not _is_safe_extract_path(target_dir, normalized):
+            logger.warn(f"AutoUpdate: Skipping unsafe path in update zip: {member}")
+            continue
+        archive.extract(member, target_dir)
+        extracted += 1
+    return extracted
+
+
 def apply_pending_update_if_any() -> str:
     """Extract a pending update zip if present. Returns a message or empty string."""
     pending_zip = backend_path(UPDATE_PENDING_ZIP)
@@ -41,7 +66,8 @@ def apply_pending_update_if_any() -> str:
     try:
         logger.log(f"AutoUpdate: Applying pending update from {pending_zip}")
         with zipfile.ZipFile(pending_zip, "r") as archive:
-            archive.extractall(get_plugin_dir())
+            extracted = _safe_extract_zip(archive, get_plugin_dir())
+        logger.log(f"AutoUpdate: Pending update extracted {extracted} files")
         try:
             os.remove(pending_zip)
         except Exception:
@@ -101,7 +127,7 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as api_err:
         logger.warn(f"AutoUpdate: GitHub API failed ({api_err}), trying proxy...")
         try:
-            proxy_url = "https://luatoolsrai.vercel.app/api/github-latest"
+            proxy_url = "https://luatools.vercel.app/api/github-latest"
             logger.log(f"AutoUpdate: Fetching GitHub release from proxy {proxy_url}")
             resp = client.get(proxy_url, follow_redirects=True, timeout=15)
             logger.log(f"AutoUpdate: Proxy GitHub API response: status={resp.status_code}")
@@ -134,7 +160,7 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     if not zip_url and tag_name:
-        zip_url = f"https://luatoolsrai.vercel.app/api/get-plugin/{tag_name}"
+        zip_url = f"https://luatools.vercel.app/api/get-plugin/{tag_name}"
         logger.log(f"AutoUpdate: Using proxy download URL: {zip_url}")
 
     if not zip_url:
@@ -144,20 +170,36 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {"version": version, "zip_url": zip_url}
 
 
+_CHUNK_SIZE = 65536  # 64 KB
+
+
 def _download_and_extract_update(zip_url: str, pending_zip: str) -> bool:
     client = ensure_http_client("AutoUpdate: download")
     try:
         logger.log(f"AutoUpdate: Downloading {zip_url} -> {pending_zip}")
-        with client.stream("GET", zip_url, follow_redirects=True) as response:
+        with client.stream("GET", zip_url, follow_redirects=True, timeout=120) as response:
             logger.log(f"AutoUpdate: Update download response: status={response.status_code}")
             response.raise_for_status()
             with open(pending_zip, "wb") as output:
-                for chunk in response.iter_bytes():
+                for chunk in response.iter_bytes(chunk_size=_CHUNK_SIZE):
                     if chunk:
                         output.write(chunk)
+        # Validate the downloaded file is actually a zip before reporting success
+        if not zipfile.is_zipfile(pending_zip):
+            logger.warn("AutoUpdate: Downloaded file is not a valid zip archive")
+            try:
+                os.remove(pending_zip)
+            except Exception:
+                pass
+            return False
         return True
     except Exception as exc:
         logger.warn(f"AutoUpdate: Failed to download update: {exc}")
+        try:
+            if os.path.exists(pending_zip):
+                os.remove(pending_zip)
+        except Exception:
+            pass
         return False
 
 
@@ -208,15 +250,16 @@ def check_for_update_once() -> str:
     if not _download_and_extract_update(zip_url, pending_zip):
         return ""
 
-    # Attempt to extract immediately
+    # Attempt to extract immediately with path traversal protection
+    plugin_dir = get_plugin_dir()
     try:
         with zipfile.ZipFile(pending_zip, "r") as archive:
-            archive.extractall(get_plugin_dir())
+            extracted = _safe_extract_zip(archive, plugin_dir)
+        logger.log(f"AutoUpdate: Extracted {extracted} files; update will take effect after restart")
         try:
             os.remove(pending_zip)
         except Exception:
             pass
-        logger.log("AutoUpdate: Update extracted; will take effect after restart")
         return f"LuaTools updated to {latest_version}. Please restart Steam."
     except Exception as extract_err:
         logger.warn(
