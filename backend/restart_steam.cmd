@@ -9,10 +9,10 @@ taskkill /IM steam.exe /F >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 if defined STEAM_DIR (
-  start "" "%STEAM_DIR%\Steam.exe" -clearbeta
+  start "" "%STEAM_DIR%\Steam.exe"
 ) else (
   rem Fallback: try launching via path on PATH or shell association
-  start "" steam.exe -clearbeta
+  start "" steam.exe
 )
 
 exit
