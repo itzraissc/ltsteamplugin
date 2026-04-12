@@ -1,0 +1,279 @@
+--- 
++++ 
+@@ -12 +11,0 @@
+-import concurrent.futures
+@@ -27,0 +27 @@
++import httpx
+@@ -30 +30 @@
+-from steam_utils import detect_steam_install_path, has_lua_for_app, trigger_steam_library_refresh
++from steam_utils import detect_steam_install_path, has_lua_for_app
+@@ -40 +40 @@
+-APP_INFO_CACHE: Dict[int, Dict[str, Any]] = {}
++APP_INFO_CACHE: Dict = {}
+@@ -59,18 +59,3 @@
+-GAMES_DB_DATA: Dict[str, Any] = {}
+-GAMES_DB_LOADED: bool = False
+-GAMES_DB_LOCK = threading.RLock()
+-
+-
+-def _fix_mojibake(name: str) -> str:
+-    """Fix common UTF-8 strings incorrectly decoded as Windows-1251 by external APIs."""
+-    if not name:
+-        return name
+-    try:
+-        # Detect Cyrillic mojibake markers for trademark, registered, copyright, dashes, or accented characters
+-        if any(token in name for token in ("в„", "В®", "В©", "Г", "Р", "в€™", "в€“", "в€”")):
+-            return name.encode("cp1251").decode("utf-8")
+-    except Exception:
+-        pass
+-    
+-    # Generic fallback for common symbols if pure recoding fails
+-    return name.replace("в„ў", "™").replace("В®", "®").replace("В©", "©").replace("в€™", "'").replace("в€“", "-").replace("в€”", "-")
++GAMES_DB_DATA: Dict[int, Any] = {}
++GAMES_DB_LOADED = False
++GAMES_DB_LOCK = threading.Lock()
+@@ -148 +133 @@
+-                name = _fix_mojibake(name.strip())
++                name = name.strip()
+@@ -164 +149 @@
+-
++    
+@@ -168,0 +154 @@
++    global LAST_API_CALL_TIME
+@@ -368 +354 @@
+-                            APPLIST_DATA[int(appid)] = _fix_mojibake(name.strip())
++                            APPLIST_DATA[int(appid)] = name.strip()
+@@ -597,9 +583 @@
+-        depots: Dict[str, Any] = {"ids": [], "lines": {}}
+-        
+-        # Otimização RegEx: Compilação Antecipada (Evita reinicialização mil vezes no for loop)
+-        rx_manifest = re.compile(r"^\s*setManifestid\(")
+-        rx_appid = re.compile(r"^\s*addappid\(")
+-        rx_comment = re.compile(r"^\s*--")
+-        rx_digits = re.compile(r"\d+")
+-        rx_space = re.compile(r"^(\s*)")
+-        
++        depots = { "ids": [] , "lines": {} }
+@@ -607,2 +585,2 @@
+-            if rx_manifest.match(line) and not rx_comment.match(line):
+-                line = rx_space.sub(r"\1--", line)
++            if re.match(r"^\s*setManifestid\(", line) and not re.match(r"^\s*--", line):
++                line = re.sub(r"^(\s*)", r"\1--", line)
+@@ -610,7 +588,8 @@
+-            
+-            if rx_appid.match(line) and not rx_comment.match(line):
+-                if (m := rx_digits.search(line)):
+-                    depot_id = m.group()
+-                    if depot_id not in depots["ids"]:
+-                        depots["ids"].append(depot_id)
+-                    depots["lines"][depot_id] = line
++            if re.match(r"^\s*addappid\(", line) and not re.match(r"^\s*--", line):
++                if (m := re.search(r"\d+", line)):
++                    id = m.group()
++
++                    depots["ids"].append(id)
++                    if id not in depots["lines"]:
++                        depots["lines"][id] = []
++                    depots["lines"][id] = line
+@@ -624,5 +602,0 @@
+-            
+-        # Delay to allow NTFS to index depotcache/*.manifest files
+-        # Prevents race conditions where Steam reads the new .lua before manifests are physically available
+-        time.sleep(0.3)  # Reduzido de 0.5 para 0.3 (Suficiente após a extração RAM síncrona)
+-        
+@@ -631,3 +604,0 @@
+-            output.flush()
+-            os.fsync(output.fileno())  # Force immediate flush to disk purely for the .lua file
+-            
+@@ -635 +605,0 @@
+-
+@@ -637,8 +606,0 @@
+-
+-        # Trigger Steam library refresh so the game appears immediately
+-        # without requiring a Steam restart or offline/online toggle.
+-        # Uses 3 strategies: steam:// URI, ACF mtime touch, sentinel file.
+-        try:
+-            trigger_steam_library_refresh(appid)
+-        except Exception as refresh_exc:
+-            logger.warn(f"LuaTools: Library refresh failed (non-fatal): {refresh_exc}")
+@@ -653,4 +615 @@
+-            # Workshop presence check
+-            # BUG FIX: work_depot is str (result of str()), not int.
+-            # Comparing str to int (== 0) always returns False in Python 3,
+-            # which caused workshop to always show "Missing ❌" even without a workshop.
++            # Workshop presence
+@@ -658,2 +617,2 @@
+-            if work_depot in ("0", "", "None", "False"):
+-                workshop_result = "No workshop for the game ✅"
++            if work_depot == "0":
++                workshop_result = "No workshop for the game"
+@@ -661,5 +620,3 @@
+-                # Check if this depot is in addappid lines AND has a decryption key
+-                if work_depot in depots["ids"] and re.search(
+-                    r",\d+,[\"']", depots["lines"].get(work_depot, "").replace(" ", "")
+-                ):
+-                    workshop_result = "Included 🎉"
++                # Checking if mentionned in addappid lines + if it includes a decryption key
++                if work_depot in depots["ids"] and re.search(rf",\d+,[\"']", depots["lines"][work_depot].replace(" ", "")):
++                    workshop_result = "Included"
+@@ -667 +624 @@
+-                    workshop_result = "Missing ❌"
++                    workshop_result = "Missing"
+@@ -669,8 +626,5 @@
+-            # DLC listing
+-            # BUG FIX: previously `if int(dlc) in depots:` checked whether
+-            # the integer was a KEY of the dict {"ids": ..., "lines": ...},
+-            # which is always False. Fixed to check depots["ids"] (a list of str).
+-            dlc_result: Dict[str, list] = {"included": [], "missing": []}
+-            dlc_list_raw = info.get("dlc_list", "")
+-            if dlc_list_raw:
+-                dlcs = [d.strip() for d in dlc_list_raw.split(",") if d.strip()]
++            # Dlc listing
++            dlc_result = { "included": [], "missing": [] }
++            if info.get("dlc_list", "") != "":
++                dlcs = info["dlc_list"].split(",")
++
+@@ -678,2 +632 @@
+-                    # depots["ids"] contains string depot IDs
+-                    if str(dlc) in depots["ids"]:
++                    if dlc in depots["ids"]:
+@@ -777 +730 @@
+-                    for chunk in resp.iter_bytes(chunk_size=65536):
++                    for chunk in resp.iter_bytes():
+@@ -872,9 +825,8 @@
+-            # Detect timeout by class name to avoid a hard dependency on httpx internals
+-            err_class = type(err).__name__.lower()
+-            is_timeout = "timeout" in err_class or "readtimeout" in err_class or "connecttimeout" in err_class
+-            error_type = "timeout" if is_timeout else "error"
+-            error_code: Any = None
+-            resp_obj = getattr(err, "response", None)
+-            if resp_obj is not None:
+-                error_code = getattr(resp_obj, "status_code", None)
+-
++            # Track error for this API - check if it's a timeout
++            error_type = "timeout" if isinstance(err, (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout)) else "error"
++            error_code = None
++            if isinstance(err, httpx.HTTPStatusError):
++                error_code = err.response.status_code if err.response else None
++            elif hasattr(err, "response") and err.response:
++                error_code = err.response.status_code
++            
+@@ -883 +835,4 @@
+-            api_errors[name] = {"type": error_type, "code": error_code}
++            if error_type == "timeout":
++                api_errors[name] = {"type": "timeout"}
++            else:
++                api_errors[name] = {"type": "error", "code": error_code}
+@@ -891,5 +846 @@
+-    """Check all enabled APIs for a specific appid and return their availability.
+-
+-    Called by the frontend before showing the 'Select Download Source' dialog.
+-    Uses HEAD requests (GET fallback) to avoid downloading data unnecessarily.
+-    """
++    """Check all enabled APIs for a specific appid and return their availability."""
+@@ -905,0 +857 @@
++    results = []
+@@ -907,4 +859,4 @@
+-    headers = {"User-Agent": USER_AGENT}
+-
+-    # Fast-path: Ryuu endpoint returns availability for all APIs at once
+-    fast_check_data: Dict[str, Any] = {}
++
++    fast_check_succeeded = False
++    fast_check_data = {}
++    
+@@ -914 +866 @@
+-            headers={"User-Agent": USER_AGENT},
++            headers={"User-Agent": "secretgoonpoon"},
+@@ -916 +868 @@
+-            follow_redirects=True,
++            follow_redirects=True
+@@ -919,7 +871,9 @@
+-            data = fast_resp.json()
+-            if isinstance(data, dict):
+-                fast_check_data = data
+-    except Exception as exc:
+-        logger.warn(f"LuaTools: Fast API check failed (non-fatal): {exc}")
+-
+-    def _check_api(api: Dict[str, Any]) -> Dict[str, Any]:
++            fast_check_data = fast_resp.json()
++            fast_check_succeeded = isinstance(fast_check_data, dict)
++    except Exception as exc:
++        logger.warn(f"LuaTools: Fast API check failed: {exc}")
++
++    # Use a small timeout for availability check
++    headers = {"User-Agent": USER_AGENT}
++    
++    for api in apis:
+@@ -932 +886 @@
+-                return {}  # Not enabled
++                continue
+@@ -937,3 +891,2 @@
+-
+-        # Use fast-check result if present
+-        if fast_check_data:
++        
++        if fast_check_succeeded:
+@@ -941 +894,2 @@
+-            available = fast_check_data.get(check_key) == "available"
++            if fast_check_data.get(check_key) == "available":
++                available = True
+@@ -945,4 +899 @@
+-                    status_url = (
+-                        f"https://manifest.morrenus.xyz/api/v1/status/{appid}"
+-                        f"?api_key={morrenus_api_key}"
+-                    )
++                    status_url = f"https://manifest.morrenus.xyz/api/v1/status/{appid}?api_key={morrenus_api_key}"
+@@ -950 +901,2 @@
+-                    available = resp.status_code == success_code
++                    if resp.status_code == success_code:
++                        available = True
+@@ -951,0 +904 @@
++                    # We use HEAD for fast checking if possible, fallback to small GET
+@@ -953 +906,3 @@
+-                    if resp.status_code == 405:  # HEAD not allowed — fall back to GET
++                    if resp.status_code == success_code:
++                        available = True
++                    elif resp.status_code == 405: # Method Not Allowed - some APIs don't like HEAD
+@@ -955 +910,2 @@
+-                    available = resp.status_code == success_code
++                        if resp.status_code == success_code:
++                            available = True
+@@ -959 +915 @@
+-        return {
++        results.append({
+@@ -962,8 +918,2 @@
+-            "url": url if available else None,
+-        }
+-
+-    results = []
+-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+-        for result in executor.map(_check_api, apis):
+-            if result:
+-                results.append(result)
++            "url": url if available else None
++        })
+@@ -990,2 +940 @@
+-                for chunk in resp.iter_bytes(chunk_size=65536):
+-                    if not chunk: continue
++                for chunk in resp.iter_bytes():
+@@ -1002,7 +951,4 @@
+-        try:
+-            fetched_name = _fetch_app_name(appid) or f"UNKNOWN ({appid})"
+-            _append_loaded_app(appid, fetched_name)
+-            _log_appid_event(f"ADDED - {api_name}", appid, fetched_name)
+-        except Exception:
+-            pass
+-            
++        fetched_name = _fetch_app_name(appid) or f"UNKNOWN ({appid})"
++        _append_loaded_app(appid, fetched_name)
++        _log_appid_event(f"ADDED - {api_name}", appid, fetched_name)
++        
+@@ -1014,2 +960 @@
+-                try: os.remove(dest_path)
+-                except Exception: pass
++                os.remove(dest_path)
+@@ -1240 +1184,0 @@
+-    "check_apis_for_app",
+@@ -1253,0 +1198 @@
++    "check_apis_for_app",

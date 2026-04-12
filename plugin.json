@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
   "name": "luatools",
-  "common_name": "LuaTools Mod by Raí",
-  "description": "LuaTools Steam Plugin!",
-  "version": "7.2.3",
+  "common_name": "LuaTools Premium by Itzraissc",
+  "description": "LuaTools Steam Plugin - Industrial Premium Edit",
+  "version": "7.2.9",
   "include": [
     "public"
   ]
