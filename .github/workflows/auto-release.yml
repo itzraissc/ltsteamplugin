@@ -24,6 +24,11 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: patch
 
+      - name: Atualizar versão no plugin.json
+        run: |
+          # Usa o jq, que já é nativo no ubuntu, para empurrar de forma limpa a versão SEM o 'v'
+          jq '.version = "${{ steps.tag_version.outputs.new_version }}"' plugin.json > tmp.json && mv tmp.json plugin.json
+
       # Aqui definimos o nome exato do arquivo como solicitado
       - name: Zipar os arquivos do plugin
         run: zip -r ltsteamplugin.zip public backend requirements.txt plugin.json
