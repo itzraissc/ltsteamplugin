@@ -1225,6 +1225,7 @@ def get_installed_lua_scripts() -> str:
 
 __all__ = [
     "cancel_add_via_luatools",
+    "check_apis_for_app",
     "delete_luatools_for_app",
     "dismiss_loaded_apps",
     "fetch_app_name",
@@ -1238,4 +1239,5 @@ __all__ = [
     "init_games_db",
     "read_loaded_apps",
     "start_add_via_luatools",
+    "start_add_via_luatools_from_url",
 ]
