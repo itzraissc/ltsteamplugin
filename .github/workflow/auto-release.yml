@@ -24,6 +24,11 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: patch
 
+      - name: Inject version into plugin.json
+        run: |
+          sed -i 's/"version": ".*"/"version": "${{ steps.tag_version.outputs.new_tag }}"/' plugin.json
+          cat plugin.json
+
       # Aqui definimos o nome exato do arquivo como solicitado
       - name: Zipar os arquivos do plugin
         run: zip -r ltsteamplugin.zip public backend requirements.txt plugin.json

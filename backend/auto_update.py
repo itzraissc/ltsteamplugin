@@ -203,9 +203,8 @@ def _download_and_extract_update(zip_url: str, pending_zip: str) -> bool:
         return False
 
 
-def check_for_update_once() -> str:
-    """Check remote manifest (if configured) and download a newer version.
-    Returns a message for the user if an update was downloaded/applied."""
+def get_latest_update_info() -> Dict[str, Any]:
+    """Check remote manifest and return the latest version info without downloading."""
     client = ensure_http_client("AutoUpdate")
     cfg_path = backend_path(UPDATE_CONFIG_FILE)
     cfg = read_json(cfg_path)
@@ -221,7 +220,7 @@ def check_for_update_once() -> str:
     else:
         manifest_url = str(cfg.get("manifest_url", "")).strip()
         if not manifest_url:
-            return ""
+            return {}
         try:
             logger.log(f"AutoUpdate: Fetching manifest {manifest_url}")
             resp = client.get(manifest_url, follow_redirects=True)
@@ -231,18 +230,34 @@ def check_for_update_once() -> str:
             zip_url = str(manifest.get("zip_url", "")).strip()
         except Exception as exc:
             logger.warn(f"AutoUpdate: Failed to fetch manifest: {exc}")
-            return ""
+            return {}
 
     if not latest_version or not zip_url:
         logger.warn("AutoUpdate: Manifest missing version or zip_url")
-        return ""
+        return {}
 
     current_version = get_plugin_version()
-    if parse_version(latest_version) <= parse_version(current_version):
-        logger.log(
-            f"AutoUpdate: Up-to-date (current {current_version}, latest {latest_version})"
-        )
+    is_newer = parse_version(latest_version) > parse_version(current_version)
+    
+    return {
+        "latest_version": latest_version,
+        "zip_url": zip_url,
+        "current_version": current_version,
+        "is_newer": is_newer
+    }
+
+
+def check_for_update_once() -> str:
+    """Check remote manifest and download a newer version immediately.
+    Returns a message for the user if an update was downloaded/applied."""
+    info = get_latest_update_info()
+    if not info or not info.get("is_newer"):
+        if info:
+            logger.log(f"AutoUpdate: Up-to-date (current {info.get('current_version')}, latest {info.get('latest_version')})")
         return ""
+
+    latest_version = info["latest_version"]
+    zip_url = info["zip_url"]
 
     pending_zip = backend_path(UPDATE_PENDING_ZIP)
     pending_info = backend_path(UPDATE_PENDING_INFO)
@@ -275,8 +290,10 @@ def _periodic_update_check_worker():
         try:
             time.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
             logger.log("AutoUpdate: Running periodic background check...")
-            message = check_for_update_once()
-            if message:
+            info = get_latest_update_info()
+            if info and info.get("is_newer"):
+                latest = info.get("latest_version")
+                message = f"Nova atualização do LuaTools disponível (v{latest})! Clique em 'Verificar Atualização' nas configurações."
                 store_last_message(message)
                 logger.log(f"AutoUpdate: Periodic check found update: {message}")
         except Exception as exc:
@@ -325,12 +342,13 @@ def _check_and_donate_keys() -> None:
 
 def _start_initial_check_worker():
     try:
-        message = check_for_update_once()
-        if message:
+        info = get_latest_update_info()
+        if info and info.get("is_newer"):
+            latest = info.get("latest_version")
+            message = f"Nova atualização do LuaTools disponível (v{latest})! Clique em 'Verificar Atualização' nas configurações."
             store_last_message(message)
-            logger.log(f"AutoUpdate: Update available — notified user: {message}")
-            # Do NOT auto-restart Steam — user may be in an active game session.
-            # The frontend will display the message and offer a manual restart button.
+            logger.log(f"AutoUpdate: Initial check found update — notified user: {message}")
+            
         _start_periodic_update_checks()
 
         # Check and donate keys after update check completes
