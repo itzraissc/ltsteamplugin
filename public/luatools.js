@@ -6290,16 +6290,43 @@
             const payload = typeof res === "string" ? JSON.parse(res) : res;
             if (payload && payload.message) {
               const msg = String(payload.message);
-              // Check if this is an update message (contains "update" or "restart")
-              const isUpdateMsg =
-                msg.toLowerCase().includes("update") ||
-                msg.toLowerCase().includes("restart");
+              const msgLower = msg.toLowerCase();
+              const isAvailableMsg = msgLower.includes("disponível") || msgLower.includes("disponivel") || msgLower.includes("available");
+              const isRestartMsg = msgLower.includes("update") || msgLower.includes("restart");
 
-              if (isUpdateMsg) {
-                // For update messages, use confirm dialog with OK (restart) and Cancel options
+              if (isAvailableMsg) {
+                showLuaToolsConfirm(
+                  "LuaTools Update",
+                  msg + "\n\n" + (window.__LuaToolsI18n?.language === "pt" ? "Deseja baixar e instalar agora?" : "Do you want to download and install now?"),
+                  function() {
+                    // Start download
+                    if (document.querySelector(".luatools-alert-overlay")) {
+                        document.querySelector(".luatools-alert-overlay").remove();
+                    }
+                    ShowLuaToolsAlert("LuaTools", window.__LuaToolsI18n?.language === "pt" ? "Baixando atualização... Por favor, aguarde." : "Downloading update... Please wait.");
+                    Millennium.callServerMethod("luatools", "CheckForUpdatesNow", { contentScriptQuery: "" })
+                      .then(function(updRes) {
+                        try {
+                          // Try to remove downloading popup
+                          var list = document.getElementsByClassName("luatools-alert-overlay");
+                          while (list && list.length > 0) list[0].remove();
+                          
+                          const p = typeof updRes === "string" ? JSON.parse(updRes) : updRes;
+                          if (p && p.success) {
+                            askRestartConfirmation();
+                          } else {
+                            ShowLuaToolsAlert("Update Error", p && p.error ? p.error : "Unknown error");
+                          }
+                        } catch(e) {}
+                      });
+                  },
+                  function() {
+                    // Cancelled
+                  }
+                );
+              } else if (isRestartMsg) {
                 askRestartConfirmation();
               } else {
-                // For non-update messages, use regular alert
                 ShowLuaToolsAlert("LuaTools", msg);
               }
             }
