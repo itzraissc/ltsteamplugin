@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "تم تطبيق {fix} بنجاح!",
     "settings.morrenusApiKey.label": "مفتاح API مورينوس",
     "settings.morrenusApiKey.description": "مفتاح API مطلوب لاستخدام مصدر سادي. احصل عليه من {link}",
-    "settings.morrenusApiKey.placeholder": "أدخل مفتاح API الخاص بك"
+    "settings.morrenusApiKey.placeholder": "أدخل مفتاح API الخاص بك",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

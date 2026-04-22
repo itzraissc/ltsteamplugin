@@ -516,6 +516,12 @@ class Plugin:
         except Exception as exc:
             logger.warn(f"AutoUpdate: start background check failed: {exc}")
 
+        try:
+            from hubcap_automator import start_hubcap_automator
+            start_hubcap_automator()
+        except Exception as exc:
+            logger.warn(f"HubcapAutomator: start failed: {exc}")
+
         Millennium.ready()
 
     def _unload(self):

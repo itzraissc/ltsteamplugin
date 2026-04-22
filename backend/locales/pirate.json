@@ -220,6 +220,7 @@
     "{fix} applied successfully!": "{fix} nailed to the hull! Yarr!",
     "settings.morrenusApiKey.label": "Morrenus Secret Scroll",
     "settings.morrenusApiKey.description": "Ye be needin' this mark to scupper Sadie's Loot. Plunder it from {link}",
-    "settings.morrenusApiKey.placeholder": "Scribble yer secret code here"
+    "settings.morrenusApiKey.placeholder": "Scribble yer secret code here",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

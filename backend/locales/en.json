@@ -223,6 +223,7 @@
     "settings.useSteamLanguage.label": "Use Steam Language",
     "settings.useSteamLanguage.no": "No",
     "settings.useSteamLanguage.yes": "Yes",
-    "{fix} applied successfully!": "{fix} applied successfully!"
+    "{fix} applied successfully!": "{fix} applied successfully!",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

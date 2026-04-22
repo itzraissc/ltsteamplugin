@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix} sikeresen alkalmazva!",
     "settings.morrenusApiKey.label": "Morrenus API kulcs",
     "settings.morrenusApiKey.description": "API kulcs szükséges a Sadie Source használatához. Szerezze be innen: {link}",
-    "settings.morrenusApiKey.placeholder": "Adja meg az API kulcsát"
+    "settings.morrenusApiKey.placeholder": "Adja meg az API kulcsát",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

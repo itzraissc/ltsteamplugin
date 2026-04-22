@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix} succesvol toegepast!",
     "settings.morrenusApiKey.label": "Morrenus API-sleutel",
     "settings.morrenusApiKey.description": "API-sleutel vereist voor Sadie Source. Verkrijg via {link}",
-    "settings.morrenusApiKey.placeholder": "Voer uw API-sleutel in"
+    "settings.morrenusApiKey.placeholder": "Voer uw API-sleutel in",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

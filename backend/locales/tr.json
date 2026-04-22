@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix} başarıyla uygulandı!",
     "settings.morrenusApiKey.label": "Morrenus API Anahtarı",
     "settings.morrenusApiKey.description": "Sadie Source'u kullanmak için API anahtarı gereklidir. {link} adresinden alın",
-    "settings.morrenusApiKey.placeholder": "API Anahtarınızı girin"
+    "settings.morrenusApiKey.placeholder": "API Anahtarınızı girin",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

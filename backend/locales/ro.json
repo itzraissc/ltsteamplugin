@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix} aplicat cu succes!",
     "settings.morrenusApiKey.label": "Cheie API Morrenus",
     "settings.morrenusApiKey.description": "Cheia API este necesară pentru a utiliza Sadie Source. Obțineți de la {link}",
-    "settings.morrenusApiKey.placeholder": "Introduceți cheia API"
+    "settings.morrenusApiKey.placeholder": "Introduceți cheia API",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

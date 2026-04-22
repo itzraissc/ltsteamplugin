@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix} werkdeded!!! YAAAAAAAY GUD JERB ME SO SMAT!!!",
     "settings.morrenusApiKey.label": "Mornus Key",
     "settings.morrenusApiKey.description": "Key make Sadie go brrr. Get key at {link}",
-    "settings.morrenusApiKey.placeholder": "Smash key here"
+    "settings.morrenusApiKey.placeholder": "Smash key here",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

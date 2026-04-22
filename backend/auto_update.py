@@ -18,8 +18,10 @@ from config import (
     UPDATE_PENDING_ZIP,
 )
 from http_client import ensure_http_client, get_http_client
+from locales import get_locale_manager
 from logger import logger
 from paths import backend_path, get_plugin_dir
+from settings.manager import get_current_language
 from steam_utils import detect_steam_install_path
 from utils import (
     get_plugin_version,
@@ -85,6 +87,16 @@ def apply_pending_update_if_any() -> str:
         return "LuaTools update applied. Please restart Steam."
     except Exception as exc:
         logger.warn(f"AutoUpdate: Failed to apply pending update: {exc}")
+        try:
+            if os.path.exists(pending_zip):
+                os.remove(pending_zip)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(pending_info):
+                os.remove(pending_info)
+        except Exception:
+            pass
         return ""
 
 
@@ -293,7 +305,14 @@ def _periodic_update_check_worker():
             info = get_latest_update_info()
             if info and info.get("is_newer"):
                 latest = info.get("latest_version")
-                message = f"Nova atualização do LuaTools disponível (v{latest})! Clique em 'Verificar Atualização' nas configurações."
+                locale = get_current_language()
+                translate = get_locale_manager().translate
+                message_template = translate("update.available", locale)
+                if not message_template or message_template == "translation missing":
+                    message = f"Nova atualização do LuaTools disponível ({latest})! Clique em 'Verificar Atualização' nas configurações."
+                else:
+                    message = message_template.replace("{version}", latest)
+
                 store_last_message(message)
                 logger.log(f"AutoUpdate: Periodic check found update: {message}")
         except Exception as exc:
@@ -345,7 +364,14 @@ def _start_initial_check_worker():
         info = get_latest_update_info()
         if info and info.get("is_newer"):
             latest = info.get("latest_version")
-            message = f"Nova atualização do LuaTools disponível (v{latest})! Clique em 'Verificar Atualização' nas configurações."
+            locale = get_current_language()
+            translate = get_locale_manager().translate
+            message_template = translate("update.available", locale)
+            if not message_template or message_template == "translation missing":
+                message = f"Nova atualização do LuaTools disponível ({latest})! Clique em 'Verificar Atualização' nas configurações."
+            else:
+                message = message_template.replace("{version}", latest)
+
             store_last_message(message)
             logger.log(f"AutoUpdate: Initial check found update — notified user: {message}")
             

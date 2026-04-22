@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "ติดตั้ง {fix} เรียบร้อยแล้ว!",
     "settings.morrenusApiKey.label": "คีย์ API ของ Morrenus",
     "settings.morrenusApiKey.description": "ต้องใช้คีย์ API เพื่อใช้งาน Sadie Source รับได้ที่ {link}",
-    "settings.morrenusApiKey.placeholder": "กรอกคีย์ API ของคุณ"
+    "settings.morrenusApiKey.placeholder": "กรอกคีย์ API ของคุณ",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

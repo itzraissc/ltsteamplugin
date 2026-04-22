@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "{fix}が正常に適用されました！",
     "settings.morrenusApiKey.label": "Morrenus APIキー",
     "settings.morrenusApiKey.description": "Sadie Sourceを使用するにはAPIキーが必要です。{link}から入手してください",
-    "settings.morrenusApiKey.placeholder": "APIキーを入力してください"
+    "settings.morrenusApiKey.placeholder": "APIキーを入力してください",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }

@@ -223,6 +223,7 @@
     "{fix} applied successfully!": "Đã áp dụng {fix} thành công!",
     "settings.morrenusApiKey.label": "Khóa API Morrenus",
     "settings.morrenusApiKey.description": "Cần khóa API để sử dụng Sadie Source. Lấy từ {link}",
-    "settings.morrenusApiKey.placeholder": "Nhập khóa API của bạn"
+    "settings.morrenusApiKey.placeholder": "Nhập khóa API của bạn",
+    "update.available": "New LuaTools update available ({version})! Click 'Check for Updates' in settings."
   }
 }
