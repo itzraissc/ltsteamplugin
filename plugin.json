@@ -3,8 +3,6 @@
   "name": "luatools",
   "common_name": "LuaTools Premium by Itzraissc",
   "description": "LuaTools Steam Plugin — Optimized build with HuggingFace support, race condition fixes, and Mojibake corrections. Maintained by Itzraissc.",
-  "version": "7.2.9",
-  "include": [
-    "public"
-  ]
+  "version": "7.3.0",
+  "include": ["public"]
 }
