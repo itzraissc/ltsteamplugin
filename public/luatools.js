@@ -1306,7 +1306,7 @@
           this.style.display = "none";
         };
         const titleText = document.createElement("span");
-        titleText.textContent = t("menu.title", "LuaTools Mod Raí · Menu");
+        titleText.textContent = t("menu.title", "LuaTools by Raí · Menu");
         title.appendChild(titleIcon);
         title.appendChild(titleText);
 
@@ -2139,7 +2139,7 @@
     titleIcon.className = "fa-solid fa-wrench";
     titleIcon.style.cssText = `color:${colors.accent};font-size:20px;`;
     const titleText = document.createElement("span");
-    titleText.textContent = lt("LuaTools Mod Raí · Fixes Menu");
+    titleText.textContent = lt("LuaTools by Raí · Fixes Menu");
     title.appendChild(titleIcon);
     title.appendChild(titleText);
 
@@ -3254,7 +3254,7 @@
     const title = document.createElement("div");
     const settingsTitleColors = getThemeColors();
     title.style.cssText = `font-size:22px;color:${settingsTitleColors.text};font-weight:600;`;
-    title.textContent = t("settings.title", "LuaTools Mod Raí · Settings");
+    title.textContent = t("settings.title", "LuaTools by Raí · Settings");
 
     const iconButtons = document.createElement("div");
     iconButtons.style.cssText = "display:flex;gap:12px;";
@@ -3626,7 +3626,7 @@
     modal.appendChild(scrollbarStyle);
 
     function applyStaticTranslations() {
-      title.textContent = t("settings.title", "LuaTools Mod Raí · Settings");
+      title.textContent = t("settings.title", "LuaTools by Raí · Settings");
       refreshBtn.title = t("settings.refresh", "Refresh");
       saveBtn.title = t("settings.save", "Save Settings");
       backBtn.title = t("Back", "Back");
@@ -6909,7 +6909,7 @@
 
             // Update UI if overlay is present
             if (st.status === "checking" && st.currentApi && title) {
-              title.textContent = lt("LuaTools Mod Raí · {api}").replace(
+              title.textContent = lt("LuaTools by Raí · {api}").replace(
                 "{api}",
                 st.currentApi,
               );
@@ -7326,7 +7326,7 @@
     const title = document.createElement("div");
     const loadedAppsTitleColors = getThemeColors();
     title.style.cssText = `font-size:24px;color:${loadedAppsTitleColors.text};margin-bottom:20px;font-weight:700;text-shadow:0 2px 8px ${loadedAppsTitleColors.shadow};background:${loadedAppsTitleColors.gradientLight};-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;text-align:center;`;
-    title.textContent = lt("LuaTools Mod Raí · Added Games");
+    title.textContent = lt("LuaTools by Raí · Added Games");
     const body = document.createElement("div");
     const loadedAppsBodyColors = getThemeColors();
     body.style.cssText = `font-size:14px;line-height:1.8;margin-bottom:16px;max-height:320px;overflow:auto;padding:16px;border:1px solid ${loadedAppsBodyColors.border};border-radius:12px;background:${loadedAppsBodyColors.bgContainer};`;

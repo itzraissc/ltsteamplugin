@@ -32,9 +32,6 @@ env.bak/
 venv.bak/
 .venv/
 
-#Agentes
-.agent/
-
 # IDE / Editor
 .vscode/
 .idea/

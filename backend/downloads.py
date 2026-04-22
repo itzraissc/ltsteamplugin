@@ -9,7 +9,6 @@ import re
 import threading
 import time
 import datetime
-import concurrent.futures
 from typing import Any, Dict
 
 import Millennium  # type: ignore
@@ -25,9 +24,10 @@ from config import (
     WEB_UI_JS_FILE,
 )
 from http_client import ensure_http_client
+import httpx
 from logger import logger
 from paths import backend_path, public_path
-from steam_utils import detect_steam_install_path, has_lua_for_app, trigger_steam_library_refresh
+from steam_utils import detect_steam_install_path, has_lua_for_app
 from utils import count_apis, ensure_temp_download_dir, normalize_manifest_text, read_text, write_text
 
 DOWNLOAD_STATE: Dict[int, Dict[str, Any]] = {}
@@ -37,7 +37,7 @@ DOWNLOAD_LOCK = threading.Lock()
 APP_NAME_CACHE: Dict[int, str] = {}
 APP_NAME_CACHE_LOCK = threading.Lock()
 
-APP_INFO_CACHE: Dict[int, Dict[str, Any]] = {}
+APP_INFO_CACHE: Dict = {}
 APP_INFO_CACHE_LOCK = threading.Lock()
 
 # Rate limiting for Steam API calls
@@ -161,11 +161,12 @@ def _fetch_app_name(appid: int) -> str:
 
 def _fetch_app_info(appid: int) -> dict:
     """Fetch app info from steamcmd with caching.
-
+    
     Fallback order:
     1. In-memory cache
     2. Steamcmd.net (request)
     """
+    global LAST_API_CALL_TIME
 
     # Check cache first
     with APP_INFO_CACHE_LOCK:
@@ -632,16 +633,11 @@ def _process_and_install_lua(appid: int, zip_path: str) -> None:
             os.fsync(output.fileno())  # Force immediate flush to disk purely for the .lua file
             
         logger.log(f"LuaTools: Installed lua -> {dest_file}")
-
+        
+        # Allow steamworks file watcher to catch up
+        time.sleep(0.5)  # Reduzido de 1.0 para 0.5
+        
         _set_download_state(appid, {"installedPath": dest_file})
-
-        # Trigger Steam library refresh so the game appears immediately
-        # without requiring a Steam restart or offline/online toggle.
-        # Uses 3 strategies: steam:// URI, ACF mtime touch, sentinel file.
-        try:
-            trigger_steam_library_refresh(appid)
-        except Exception as refresh_exc:
-            logger.warn(f"LuaTools: Library refresh failed (non-fatal): {refresh_exc}")
 
         # Check .lua content
         try:
@@ -774,7 +770,7 @@ def _download_zip_for_app(appid: int):
                 total = int(resp.headers.get("Content-Length", "0") or "0")
                 _set_download_state(appid, {"status": "downloading", "bytesRead": 0, "totalBytes": total})
                 with open(dest_path, "wb") as output:
-                    for chunk in resp.iter_bytes(chunk_size=65536):
+                    for chunk in resp.iter_bytes():
                         if not chunk:
                             continue
                         if _is_download_cancelled(appid):
@@ -869,167 +865,24 @@ def _download_zip_for_app(appid: int):
             return
         except Exception as err:
             logger.warn(f"LuaTools: API '{name}' failed with error: {err}")
-            # Detect timeout by class name to avoid a hard dependency on httpx internals
-            err_class = type(err).__name__.lower()
-            is_timeout = "timeout" in err_class or "readtimeout" in err_class or "connecttimeout" in err_class
-            error_type = "timeout" if is_timeout else "error"
-            error_code: Any = None
-            resp_obj = getattr(err, "response", None)
-            if resp_obj is not None:
-                error_code = getattr(resp_obj, "status_code", None)
-
+            # Track error for this API - check if it's a timeout
+            error_type = "timeout" if isinstance(err, (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout)) else "error"
+            error_code = None
+            if isinstance(err, httpx.HTTPStatusError):
+                error_code = err.response.status_code if err.response else None
+            elif hasattr(err, "response") and err.response:
+                error_code = err.response.status_code
+            
             state = _get_download_state(appid)
             api_errors = state.get("apiErrors", {})
-            api_errors[name] = {"type": error_type, "code": error_code}
+            if error_type == "timeout":
+                api_errors[name] = {"type": "timeout"}
+            else:
+                api_errors[name] = {"type": "error", "code": error_code}
             _set_download_state(appid, {"apiErrors": api_errors})
             continue
 
     _set_download_state(appid, {"status": "failed", "error": "Not available on any API"})
-
-
-def check_apis_for_app(appid: int) -> str:
-    """Check all enabled APIs for a specific appid and return their availability.
-
-    Called by the frontend before showing the 'Select Download Source' dialog.
-    Uses HEAD requests (GET fallback) to avoid downloading data unnecessarily.
-    """
-    try:
-        appid = int(appid)
-    except Exception:
-        return json.dumps({"success": False, "error": "Invalid appid"})
-
-    client = ensure_http_client("LuaTools: check_apis")
-    apis = load_api_manifest()
-    if not apis:
-        return json.dumps({"success": True, "results": []})
-
-    morrenus_api_key = get_morrenus_api_key()
-    headers = {"User-Agent": USER_AGENT}
-
-    # Fast-path: Ryuu endpoint returns availability for all APIs at once
-    fast_check_data: Dict[str, Any] = {}
-    try:
-        fast_resp = client.get(
-            f"http://167.235.229.108/check_apis?appid={appid}",
-            headers={"User-Agent": USER_AGENT},
-            timeout=5,
-            follow_redirects=True,
-        )
-        if fast_resp.status_code == 200:
-            data = fast_resp.json()
-            if isinstance(data, dict):
-                fast_check_data = data
-    except Exception as exc:
-        logger.warn(f"LuaTools: Fast API check failed (non-fatal): {exc}")
-
-    def _check_api(api: Dict[str, Any]) -> Dict[str, Any]:
-        name = api.get("name", "Unknown")
-        template = api.get("url", "")
-        success_code = int(api.get("success_code", 200))
-
-        if "<moapikey>" in template:
-            if not morrenus_api_key:
-                return {}  # Not enabled
-            template = template.replace("<moapikey>", morrenus_api_key)
-
-        url = template.replace("<appid>", str(appid))
-        available = False
-
-        # Use fast-check result if present
-        if fast_check_data:
-            check_key = "Sadie (Morrenus)" if name.lower() == "morrenus" else name
-            available = fast_check_data.get(check_key) == "available"
-        else:
-            try:
-                if name.lower() == "morrenus":
-                    status_url = (
-                        f"https://manifest.morrenus.xyz/api/v1/status/{appid}"
-                        f"?api_key={morrenus_api_key}"
-                    )
-                    resp = client.get(status_url, headers=headers, follow_redirects=True, timeout=5)
-                    available = resp.status_code == success_code
-                else:
-                    resp = client.head(url, headers=headers, follow_redirects=True, timeout=5)
-                    if resp.status_code == 405:  # HEAD not allowed — fall back to GET
-                        resp = client.get(url, headers=headers, follow_redirects=True, timeout=5)
-                    available = resp.status_code == success_code
-            except Exception:
-                pass
-
-        return {
-            "name": name,
-            "available": available,
-            "url": url if available else None,
-        }
-
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for result in executor.map(_check_api, apis):
-            if result:
-                results.append(result)
-
-    return json.dumps({"success": True, "results": results})
-
-
-def _download_zip_from_url(appid: int, url: str, api_name: str):
-    """Internal worker to download from a specific URL."""
-    client = ensure_http_client("LuaTools: download_direct")
-    dest_root = ensure_temp_download_dir()
-    dest_path = os.path.join(dest_root, f"{appid}.zip")
-    
-    _set_download_state(appid, {"status": "downloading", "currentApi": api_name, "bytesRead": 0, "totalBytes": 0, "dest": dest_path})
-
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length", "0") or "0")
-            _set_download_state(appid, {"totalBytes": total})
-            
-            with open(dest_path, "wb") as output:
-                for chunk in resp.iter_bytes(chunk_size=65536):
-                    if not chunk: continue
-                    if _is_download_cancelled(appid):
-                        raise RuntimeError("cancelled")
-                    output.write(chunk)
-                    state = _get_download_state(appid)
-                    read = int(state.get("bytesRead", 0)) + len(chunk)
-                    _set_download_state(appid, {"bytesRead": read})
-
-        _set_download_state(appid, {"status": "processing"})
-        _process_and_install_lua(appid, dest_path)
-        
-        try:
-            fetched_name = _fetch_app_name(appid) or f"UNKNOWN ({appid})"
-            _append_loaded_app(appid, fetched_name)
-            _log_appid_event(f"ADDED - {api_name}", appid, fetched_name)
-        except Exception:
-            pass
-            
-        _set_download_state(appid, {"status": "done", "success": True, "api": api_name})
-
-    except Exception as exc:
-        if str(exc) == "cancelled":
-            if os.path.exists(dest_path):
-                try: os.remove(dest_path)
-                except Exception: pass
-            _set_download_state(appid, {"status": "cancelled", "error": "Cancelled by user"})
-        else:
-            logger.warn(f"LuaTools: _download_zip_from_url failed: {exc}")
-            _set_download_state(appid, {"status": "failed", "error": str(exc)})
-
-
-def start_add_via_luatools_from_url(appid: int, url: str, api_name: str) -> str:
-    """Initiate a download from a specific URL selected by the user."""
-    try:
-        appid = int(appid)
-    except Exception:
-        return json.dumps({"success": False, "error": "Invalid appid"})
-
-    _set_download_state(appid, {"status": "queued", "bytesRead": 0, "totalBytes": 0, "error": None})
-    thread = threading.Thread(target=_download_zip_from_url, args=(appid, url, api_name), daemon=True)
-    thread.start()
-    return json.dumps({"success": True})
 
 
 def start_add_via_luatools(appid: int) -> str:
@@ -1237,7 +1090,6 @@ def get_installed_lua_scripts() -> str:
 
 __all__ = [
     "cancel_add_via_luatools",
-    "check_apis_for_app",
     "delete_luatools_for_app",
     "dismiss_loaded_apps",
     "fetch_app_name",
@@ -1251,5 +1103,4 @@ __all__ = [
     "init_games_db",
     "read_loaded_apps",
     "start_add_via_luatools",
-    "start_add_via_luatools_from_url",
 ]

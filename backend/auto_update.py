@@ -328,14 +328,11 @@ def _start_initial_check_worker():
         message = check_for_update_once()
         if message:
             store_last_message(message)
-            logger.log(
-                f"AutoUpdate: Initial check found update: {message}. Auto-restarting Steam..."
-            )
-            time.sleep(2)
-            restart_steam_internal()
-        else:
-            _start_periodic_update_checks()
-        
+            logger.log(f"AutoUpdate: Update available — notified user: {message}")
+            # Do NOT auto-restart Steam — user may be in an active game session.
+            # The frontend will display the message and offer a manual restart button.
+        _start_periodic_update_checks()
+
         # Check and donate keys after update check completes
         _check_and_donate_keys()
     except Exception as exc:
@@ -344,6 +341,7 @@ def _start_initial_check_worker():
             _start_periodic_update_checks()
         except Exception:
             pass
+
 
 
 def start_auto_update_background_check() -> None:

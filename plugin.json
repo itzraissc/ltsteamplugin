@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
-  "name": "luatools mod raí",
-  "common_name": "LuaTools Mod Raí",
-  "description": "LuaTools Steam Plugin - Industrial Premium Edit",
+  "name": "luatools",
+  "common_name": "LuaTools Premium by Itzraissc",
+  "description": "LuaTools Steam Plugin — Optimized build with HuggingFace support, race condition fixes, and Mojibake corrections. Maintained by Itzraissc.",
   "version": "7.2.9",
   "include": [
     "public"

@@ -14,8 +14,8 @@ from config import (
 )
 from http_client import ensure_http_client, get_http_client
 from logger import logger
-from paths import backend_path
 from utils import (
+    backend_path,
     count_apis,
     normalize_manifest_text,
     read_text,
