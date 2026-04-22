@@ -95,13 +95,11 @@ def _fetch_hf_tree(repo_id: str, path: str) -> set:
 
 
 def _fetch_fixes_index() -> Optional[Dict]:
-    """Fetch and cache the fixes availability index.
+    """Fetch and cache the fixes availability index directly from HuggingFace.
 
-    Three-tier strategy — most reliable to most expensive:
-      1. Centralized JSON index (index.luatools.work) — single HTTP GET, O(1) parse.
-      2. HuggingFace dataset tree walk — enumerates all ZIPs on the HF repo;
-         used when the centralized index is unavailable (server down / cold cache).
-      3. None — callers fall back to per-appid HEAD requests.
+    Strategy:
+      1. HuggingFace dataset tree walk — enumerates all ZIPs on the HF repo.
+      2. None — callers fall back to per-appid HEAD requests.
 
     Result is cached for the entire Steam session; a plugin reload always refetches.
     """
@@ -111,35 +109,10 @@ def _fetch_fixes_index() -> Optional[Dict]:
         if _fixes_index_cache is not None:
             return _fixes_index_cache
 
-    # ── Tier 1: Centralized index (fastest, preferred) ───────────────────────
+    # ── Tier 1: HuggingFace dataset tree walk (authoritative) ────────
+    # Reads directly from the source repo: RaiSantos/fix
     try:
-        client = ensure_http_client("LuaTools: FixesIndex")
-        resp = client.get(FIXES_INDEX_URL, follow_redirects=True, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            generic_set = set(data.get("genericFixes", []))
-            online_set  = set(data.get("onlineFixes",  []))
-            index = {"generic": generic_set, "online": online_set}
-            with _fixes_index_lock:
-                _fixes_index_cache = index
-            logger.log(
-                f"LuaTools: [Tier-1] Fixes index loaded — "
-                f"{len(generic_set)} generic, {len(online_set)} online"
-            )
-            return index
-        else:
-            logger.warn(
-                f"LuaTools: [Tier-1] Centralized index returned {resp.status_code}, "
-                "falling back to HF tree walk..."
-            )
-    except Exception as exc:
-        logger.warn(f"LuaTools: [Tier-1] Centralized index unreachable: {exc}, falling back to HF tree walk...")
-
-    # ── Tier 2: HuggingFace dataset tree walk (authoritative fallback) ────────
-    # This is slower (multiple paginated API calls) but is the ground truth —
-    # it reads directly from the source repo and is immune to index server outages.
-    try:
-        logger.log("LuaTools: [Tier-2] Walking HuggingFace dataset tree for RaiSantos/fix...")
+        logger.log("LuaTools: [Tier-1] Walking HuggingFace dataset tree for RaiSantos/fix...")
         generic_set = _fetch_hf_tree("RaiSantos/fix", "GameBypasses")
         online_set  = _fetch_hf_tree("RaiSantos/fix", "OnlineFix1")
 
@@ -148,17 +121,17 @@ def _fetch_fixes_index() -> Optional[Dict]:
             with _fixes_index_lock:
                 _fixes_index_cache = index
             logger.log(
-                f"LuaTools: [Tier-2] HF index built — "
+                f"LuaTools: [Tier-1] HF index built — "
                 f"{len(generic_set)} generic, {len(online_set)} online"
             )
             return index
         else:
-            logger.warn("LuaTools: [Tier-2] HF tree walk returned empty sets")
+            logger.warn("LuaTools: [Tier-1] HF tree walk returned empty sets")
     except Exception as exc:
-        logger.warn(f"LuaTools: [Tier-2] HF tree walk failed: {exc}")
+        logger.warn(f"LuaTools: [Tier-1] HF tree walk failed: {exc}")
 
-    # ── Tier 3: None — check_for_fixes will do per-appid HEAD requests ────────
-    logger.warn("LuaTools: [Tier-3] Both index sources failed — falling back to per-appid HEAD checks")
+    # ── Tier 2: None — check_for_fixes will do per-appid HEAD requests ────────
+    logger.warn("LuaTools: [Tier-2] Index source failed — falling back to per-appid HEAD checks")
     return None
 
 
