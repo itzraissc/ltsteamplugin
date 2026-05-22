@@ -150,6 +150,7 @@ def init_fixes_index() -> None:
     threading.Thread(target=_worker, daemon=True, name="LuaTools-FixesIndex").start()
 
 
+
 def _is_safe_path(base_path: str, target_path: str) -> bool:
     """Return True only if target_path resolves within base_path (prevents path traversal)."""
     abs_base = os.path.abspath(base_path)

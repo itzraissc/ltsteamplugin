@@ -48,7 +48,7 @@ def init_apis(content_script_query: str = "") -> str:
             # Try primary URL first
             try:
                 logger.log(f"InitApis: Fetching manifest from {API_MANIFEST_URL}")
-                resp = client.get(API_MANIFEST_URL)
+                resp = client.get(API_MANIFEST_URL, timeout=15)
                 logger.log(f"InitApis: Manifest response: status={resp.status_code}")
                 resp.raise_for_status()
                 manifest_text = resp.text
@@ -114,7 +114,7 @@ def fetch_free_apis_now(content_script_query: str = "") -> str:
 
         try:
             logger.log(f"LuaTools: Fetching manifest from {API_MANIFEST_URL}")
-            resp = client.get(API_MANIFEST_URL, follow_redirects=True)
+            resp = client.get(API_MANIFEST_URL, follow_redirects=True, timeout=15)
             logger.log(f"LuaTools: Manifest response: status={resp.status_code}")
             resp.raise_for_status()
             manifest_text = resp.text

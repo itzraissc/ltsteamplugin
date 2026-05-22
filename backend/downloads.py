@@ -755,7 +755,7 @@ def _download_zip_for_app(appid: int):
             if _is_download_cancelled(appid):
                 logger.log(f"LuaTools: Download cancelled before contacting API '{name}'")
                 return
-            with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+            with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=30) as resp:
                 code = resp.status_code
                 logger.log(f"LuaTools: API '{name}' status={code}")
                 if code == unavailable_code:
@@ -939,7 +939,7 @@ def check_apis_for_app(appid: int) -> str:
         else:
             try:
                 if name.lower() == "morrenus":
-                    status_url = f"https://manifest.morrenus.xyz/api/v1/status/{appid}?api_key={morrenus_api_key}"
+                    status_url = f"https://hubcapmanifest.com/api/v1/status/{appid}?api_key={morrenus_api_key}"
                     resp = client.get(status_url, headers=headers, follow_redirects=True, timeout=5)
                     if resp.status_code == success_code:
                         available = True
@@ -974,7 +974,7 @@ def _download_zip_from_url(appid: int, url: str, api_name: str):
 
     try:
         headers = {"User-Agent": USER_AGENT}
-        with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+        with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=30) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", "0") or "0")
             _set_download_state(appid, {"totalBytes": total})

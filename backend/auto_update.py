@@ -130,7 +130,7 @@ def _fetch_github_latest(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Primary GitHub API
     try:
         logger.log(f"AutoUpdate: Fetching GitHub release from {endpoint}")
-        resp = client.get(endpoint, headers=headers, follow_redirects=True)
+        resp = client.get(endpoint, headers=headers, follow_redirects=True, timeout=15)
         logger.log(f"AutoUpdate: GitHub API response: status={resp.status_code}")
         resp.raise_for_status()
         data = resp.json()
@@ -235,7 +235,7 @@ def get_latest_update_info() -> Dict[str, Any]:
             return {}
         try:
             logger.log(f"AutoUpdate: Fetching manifest {manifest_url}")
-            resp = client.get(manifest_url, follow_redirects=True)
+            resp = client.get(manifest_url, follow_redirects=True, timeout=15)
             resp.raise_for_status()
             manifest = resp.json()
             latest_version = str(manifest.get("version", "")).strip()
